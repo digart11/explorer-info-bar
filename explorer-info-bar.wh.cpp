@@ -1,12 +1,68 @@
 // ==WindhawkMod==
 // @id              explorer-info-bar
 // @name            Explorer Info Bar
-// @description     Enhances File Explorer's bottom info bar with drive, content, selection, and single-file details, with customizable styles and colors.
-// @version         0.49
-// @author          digart11
+// @description     Adds drive, folder, selection, and file details to File Explorer's bottom info bar.
+// @version         1.0.0
+// @author          digART
+// @github          https://github.com/digart11
+// @homepage        https://github.com/digart11/explorer-info-bar
+// @license         GPL-3.0-only
 // @include         explorer.exe
 // @compilerOptions -lole32 -lshell32 -luuid -lgdi32 -lcomctl32 -lpropsys
 // ==/WindhawkMod==
+
+// ==WindhawkModReadme==
+/*
+# Explorer Info Bar
+
+A customizable Windhawk mod that enhances the bottom info bar in Windows 11 File Explorer.
+
+Explorer Info Bar adds useful drive, folder, selection, and single-file information while keeping the native Explorer look and adapting to light, dark, and customized themes.
+
+## Features
+
+- Drive free-space information
+- Current folder content summary
+  - Folder count
+  - File count
+  - Immediate file size total
+- Selection information
+  - Selected folders
+  - Selected files
+  - Selected file size
+- Single-file details when available
+  - Real file extension
+  - Image resolution
+  - Video resolution
+  - Media duration
+- Three display styles
+  - Simple
+  - Flat panes
+  - Soft cards
+- Configurable section order
+- Individual section visibility controls
+- Custom text and panel colors
+- Automatic theme-derived colors by default
+- Works with File Explorer's native status area rather than replacing Explorer itself
+
+## Examples
+
+Typical information shown by the mod:
+
+Drive D: 150.7GB free
+Content: 15 folders / 25 files (77.2MB)
+Selected: 2 folders / 4 files (571KB)
+
+When one file is selected, additional details can appear:
+
+.jpg (4032&times;3024)
+.jpeg (6000&times;4000)
+.mp4 (1920&times;1080, 01:23:43)
+.mp3 (00:03:47)
+.doc
+.pdf
+*/
+// ==/WindhawkModReadme==
 
 // ==WindhawkModSettings==
 /*
@@ -78,6 +134,8 @@
 #include <commctrl.h>
 #include <propkey.h>
 #include <propvarutil.h>
+#include <objidl.h>
+#include <objbase.h>
 
 #include <string>
 #include <array>
@@ -86,6 +144,8 @@
 #include <cwctype>
 #include <cwchar>
 #include <cstdlib>
+#include <vector>
+#include <utility>
 
 #define CWM_GETISHELLBROWSER (WM_USER + 7)
 
@@ -94,6 +154,10 @@ static constexpr int kStatusRowHeight = 24;
 static constexpr ULONGLONG kStatusMarkerLifetimeMs = 250;
 static constexpr DWORD kInitialRefreshDelayMs = 1000;
 static constexpr DWORD kRefreshIntervalMs = 500;
+static constexpr ULONGLONG kContentSafetyRescanMs = 30000;
+static constexpr ULONGLONG kContentFailedRetryMs = 2000;
+static constexpr ULONGLONG kMetadataRetryMs = 5000;
+static constexpr UINT kSubclassRemovalTimeoutMs = 500;
 
 // ============================================================
 // DrawText hook
@@ -129,7 +193,9 @@ thread_local ULONGLONG g_statusMarkTick = 0;
 thread_local RECT g_statusRowRect{};
 thread_local bool g_insideFinalPaint = false;
 
-static std::atomic<HWND> g_lastDirectUiHwnd{nullptr};
+static std::atomic<bool> g_unloading{false};
+
+static SRWLOCK g_subclassLock = SRWLOCK_INIT;
 
 enum class InfoBarStyle
 {
@@ -144,6 +210,42 @@ enum class InfoBarSection
     Content,
     Selection
 };
+
+enum CacheChangeFlags : unsigned
+{
+    CacheChangeNone = 0,
+    CacheChangeDrive = 1 << 0,
+    CacheChangeContent = 1 << 1,
+    CacheChangeSelection = 1 << 2,
+    CacheChangeFileDetails = 1 << 3
+};
+
+struct InfoBarLayoutGeometry
+{
+    HWND hwnd = nullptr;
+    std::array<int, 3> sectionLeft{-1, -1, -1};
+    int fileDetailsLeft = -1;
+    int usableRight = -1;
+    InfoBarStyle style = InfoBarStyle::Simple;
+    std::array<InfoBarSection, 3> sectionOrder{};
+    bool showDrive = false;
+    bool showContent = false;
+    bool showSelection = false;
+    bool singleFileDetails = false;
+};
+
+struct TrackedDirectUiState
+{
+    HWND hwnd = nullptr;
+    bool hasLayout = false;
+    InfoBarLayoutGeometry layout;
+    COLORREF stableRowBackground = CLR_INVALID;
+    COLORREF stableNativeTextColor = CLR_INVALID;
+    HWND shellTab = nullptr;
+    DWORD shellBrowserCookie = 0;
+};
+
+static std::vector<TrackedDirectUiState> g_trackedWindows;
 
 struct ColorOverride
 {
@@ -178,18 +280,17 @@ struct ModSettings
 static SRWLOCK g_settingsLock = SRWLOCK_INIT;
 static ModSettings g_settings;
 
-static COLORREF g_stableRowBackground = CLR_INVALID;
-static COLORREF g_stableNativeTextColor = CLR_INVALID;
-static HWND g_stableRowBackgroundHwnd = nullptr;
 static constexpr UINT_PTR kDirectUiSubclassId = 0xE1B029;
+static UINT g_removeDirectUiSubclassMessage = 0;
+static UINT g_refreshDirectUiMessage = 0;
 
 static LRESULT CALLBACK DirectUiSubclassProc(
     HWND hwnd,
     UINT msg,
     WPARAM wParam,
     LPARAM lParam,
-    UINT_PTR subclassId,
-    DWORD_PTR refData
+    UINT_PTR,
+    DWORD_PTR
 );
 
 // ============================================================
@@ -199,15 +300,46 @@ static LRESULT CALLBACK DirectUiSubclassProc(
 static DWORD g_pid = 0;
 
 static HANDLE g_workerThread = nullptr;
+static DWORD g_workerThreadId = 0;
 static HANDLE g_stopEvent = nullptr;
+static HANDLE g_workerWakeEvent = nullptr;
 
 static CRITICAL_SECTION g_cacheLock;
 
-static int g_selected = -1;
-static std::wstring g_contentGroup = L"Loading...";
-static std::wstring g_selectionGroup;
-static std::wstring g_driveGroup;
-static std::wstring g_fileDetailsGroup;
+struct ContentRefreshCache
+{
+    bool valid = false;
+    std::wstring folderIdentity;
+    int itemCount = -1;
+    int files = 0;
+    int folders = 0;
+    ULONGLONG directFileBytes = 0;
+    ULONGLONG lastFullScanTick = 0;
+    std::wstring lastAttemptFolderIdentity;
+    ULONGLONG lastScanAttemptTick = 0;
+};
+
+struct SingleFileMetadataCache
+{
+    bool valid = false;
+    std::wstring path;
+    std::wstring details;
+    ULONGLONG retryAfterTick = 0;
+};
+
+struct WindowDataCache
+{
+    HWND hwnd = nullptr;
+    int selected = -1;
+    std::wstring contentGroup = L"Loading...";
+    std::wstring selectionGroup;
+    std::wstring driveGroup;
+    std::wstring fileDetailsGroup;
+    ContentRefreshCache contentRefresh;
+    SingleFileMetadataCache metadata;
+};
+
+static std::vector<WindowDataCache> g_windowDataCaches;
 
 
 static std::wstring GetStringSetting(
@@ -251,6 +383,20 @@ static ColorOverride ParseColorOverride(
     )
     {
         return result;
+    }
+
+    for (size_t i = 1; i < value.length(); i++)
+    {
+        const wchar_t ch = value[i];
+
+        if (!(
+                (ch >= L'0' && ch <= L'9') ||
+                (ch >= L'a' && ch <= L'f') ||
+                (ch >= L'A' && ch <= L'F')
+            ))
+        {
+            return result;
+        }
     }
 
     wchar_t* end = nullptr;
@@ -518,7 +664,7 @@ static std::wstring FormatBytes(
             format == ByteFormat::OneDecimal
                 ? L"%.1fTB"
                 : L"%.2fTB",
-            bytes / TB
+            static_cast<double>(bytes) / TB
         );
     }
     else if (bytes >= static_cast<ULONGLONG>(GB))
@@ -529,13 +675,13 @@ static std::wstring FormatBytes(
             format == ByteFormat::OneDecimal
                 ? L"%.1fGB"
                 : L"%.2fGB",
-            bytes / GB
+            static_cast<double>(bytes) / GB
         );
     }
     else if (bytes >= static_cast<ULONGLONG>(MB))
     {
         const double mb =
-            bytes / MB;
+            static_cast<double>(bytes) / MB;
 
         if (format == ByteFormat::OneDecimal)
         {
@@ -571,7 +717,7 @@ static std::wstring FormatBytes(
             buf,
             ARRAYSIZE(buf),
             L"%.0fKB",
-            bytes / KB
+            static_cast<double>(bytes) / KB
         );
     }
     else
@@ -620,19 +766,24 @@ static std::wstring GetLiteralExtension(
     );
 }
 
-static bool ReadUInt32Property(
+enum class PropertyReadResult
+{
+    Value,
+    Missing,
+    Failed
+};
+
+static PropertyReadResult ReadUInt32Property(
     IShellItem2* item,
     REFPROPERTYKEY key,
     UINT32* value
 )
 {
     if (!item || !value)
-        return false;
+        return PropertyReadResult::Failed;
 
     PROPVARIANT property;
-    PropVariantInit(
-        &property
-    );
+    PropVariantInit(&property);
 
     HRESULT hr =
         item->GetProperty(
@@ -640,46 +791,52 @@ static bool ReadUInt32Property(
             &property
         );
 
-    ULONG convertedValue =
-        0;
-
-    if (SUCCEEDED(hr))
+    if (FAILED(hr))
     {
-        hr =
-            PropVariantToUInt32(
-                property,
-                &convertedValue
-            );
+        PropVariantClear(&property);
+        return PropertyReadResult::Failed;
     }
 
-    PropVariantClear(
-        &property
-    );
+    if (
+        property.vt == VT_EMPTY ||
+        property.vt == VT_NULL
+    )
+    {
+        PropVariantClear(&property);
+        return PropertyReadResult::Missing;
+    }
+
+    ULONG convertedValue = 0;
+    hr =
+        PropVariantToUInt32(
+            property,
+            &convertedValue
+        );
+
+    PropVariantClear(&property);
 
     if (FAILED(hr))
-        return false;
+        return PropertyReadResult::Missing;
 
     *value =
         static_cast<UINT32>(
             convertedValue
         );
 
-    return true;
+    return PropertyReadResult::Value;
 }
 
-static bool ReadUInt64Property(
+static PropertyReadResult ReadUInt64Property(
     IShellItem2* item,
     REFPROPERTYKEY key,
     ULONGLONG* value
 )
 {
     if (!item || !value)
-        return false;
+        return PropertyReadResult::Failed;
 
     PROPVARIANT property;
-    PropVariantInit(
-        &property
-    );
+    PropVariantInit(&property);
 
     HRESULT hr =
         item->GetProperty(
@@ -687,20 +844,32 @@ static bool ReadUInt64Property(
             &property
         );
 
-    if (SUCCEEDED(hr))
+    if (FAILED(hr))
     {
-        hr =
-            PropVariantToUInt64(
-                property,
-                value
-            );
+        PropVariantClear(&property);
+        return PropertyReadResult::Failed;
     }
 
-    PropVariantClear(
-        &property
-    );
+    if (
+        property.vt == VT_EMPTY ||
+        property.vt == VT_NULL
+    )
+    {
+        PropVariantClear(&property);
+        return PropertyReadResult::Missing;
+    }
 
-    return SUCCEEDED(hr);
+    hr =
+        PropVariantToUInt64(
+            property,
+            value
+        );
+
+    PropVariantClear(&property);
+
+    return SUCCEEDED(hr)
+        ? PropertyReadResult::Value
+        : PropertyReadResult::Missing;
 }
 
 static std::wstring FormatMediaDuration(
@@ -745,36 +914,38 @@ static std::wstring FormatMediaDuration(
 
 static std::wstring BuildSingleFileDetails(
     IShellItem* item,
-    const std::wstring& path
+    const std::wstring& path,
+    bool* transientFailure
 )
 {
+    if (transientFailure)
+        *transientFailure = false;
+
     if (!item || path.empty())
         return L"";
 
     const std::wstring extension =
-        GetLiteralExtension(
-            path
-        );
+        GetLiteralExtension(path);
 
     std::wstring result =
         extension.empty()
             ? L"no extension"
             : extension;
 
-    IShellItem2* item2 =
-        nullptr;
+    IShellItem2* item2 = nullptr;
 
     if (
         FAILED(
             item->QueryInterface(
-                IID_PPV_ARGS(
-                    &item2
-                )
+                IID_PPV_ARGS(&item2)
             )
         ) ||
         !item2
     )
     {
+        if (transientFailure)
+            *transientFailure = true;
+
         return result;
     }
 
@@ -784,35 +955,35 @@ static std::wstring BuildSingleFileDetails(
     UINT32 videoHeight = 0;
     ULONGLONG duration = 0;
 
-    const bool hasImageWidth =
+    const PropertyReadResult imageWidthResult =
         ReadUInt32Property(
             item2,
             PKEY_Image_HorizontalSize,
             &imageWidth
         );
 
-    const bool hasImageHeight =
+    const PropertyReadResult imageHeightResult =
         ReadUInt32Property(
             item2,
             PKEY_Image_VerticalSize,
             &imageHeight
         );
 
-    const bool hasVideoWidth =
+    const PropertyReadResult videoWidthResult =
         ReadUInt32Property(
             item2,
             PKEY_Video_FrameWidth,
             &videoWidth
         );
 
-    const bool hasVideoHeight =
+    const PropertyReadResult videoHeightResult =
         ReadUInt32Property(
             item2,
             PKEY_Video_FrameHeight,
             &videoHeight
         );
 
-    const bool hasDuration =
+    const PropertyReadResult durationResult =
         ReadUInt64Property(
             item2,
             PKEY_Media_Duration,
@@ -821,59 +992,56 @@ static std::wstring BuildSingleFileDetails(
 
     item2->Release();
 
+    if (transientFailure)
+    {
+        *transientFailure =
+            imageWidthResult == PropertyReadResult::Failed ||
+            imageHeightResult == PropertyReadResult::Failed ||
+            videoWidthResult == PropertyReadResult::Failed ||
+            videoHeightResult == PropertyReadResult::Failed ||
+            durationResult == PropertyReadResult::Failed;
+    }
+
     UINT32 width = 0;
     UINT32 height = 0;
 
     if (
-        hasVideoWidth &&
-        hasVideoHeight &&
+        videoWidthResult == PropertyReadResult::Value &&
+        videoHeightResult == PropertyReadResult::Value &&
         videoWidth > 0 &&
         videoHeight > 0
     )
     {
-        width =
-            videoWidth;
-
-        height =
-            videoHeight;
+        width = videoWidth;
+        height = videoHeight;
     }
     else if (
-        hasImageWidth &&
-        hasImageHeight &&
+        imageWidthResult == PropertyReadResult::Value &&
+        imageHeightResult == PropertyReadResult::Value &&
         imageWidth > 0 &&
         imageHeight > 0
     )
     {
-        width =
-            imageWidth;
-
-        height =
-            imageHeight;
+        width = imageWidth;
+        height = imageHeight;
     }
 
     const std::wstring durationText =
         (
-            hasDuration &&
+            durationResult == PropertyReadResult::Value &&
             duration > 0
         )
-            ? FormatMediaDuration(
-                duration
-            )
+            ? FormatMediaDuration(duration)
             : L"";
 
     const bool hasDimensions =
         width > 0 &&
         height > 0;
 
-    const bool hasMetadata =
-        hasDimensions ||
-        !durationText.empty();
-
-    if (!hasMetadata)
+    if (!hasDimensions && durationText.empty())
         return result;
 
-    result +=
-        L" (";
+    result += L" (";
 
     if (hasDimensions)
     {
@@ -887,25 +1055,18 @@ static std::wstring BuildSingleFileDetails(
             height
         );
 
-        result +=
-            dimensions;
+        result += dimensions;
     }
 
     if (!durationText.empty())
     {
         if (hasDimensions)
-        {
-            result +=
-                L", ";
-        }
+            result += L", ";
 
-        result +=
-            durationText;
+        result += durationText;
     }
 
-    result +=
-        L")";
-
+    result += L")";
     return result;
 }
 
@@ -955,86 +1116,59 @@ static bool GetFilesystemInfo(
 }
 
 // ============================================================
-// Explorer window discovery
+// Explorer window / COM ownership
 // ============================================================
 
-struct FindCabinetContext
-{
-    DWORD pid;
-    HWND hwnd;
-};
-
-static BOOL CALLBACK FindCabinetProc(
+static HWND FindAncestorByClass(
     HWND hwnd,
-    LPARAM lParam
+    PCWSTR className
 )
 {
-    auto* ctx =
-        reinterpret_cast<FindCabinetContext*>(
-            lParam
-        );
-
-    DWORD pid = 0;
-
-    GetWindowThreadProcessId(
-        hwnd,
-        &pid
-    );
-
-    if (pid != ctx->pid)
-        return TRUE;
-
-    wchar_t cls[128] = {};
-
-    GetClassNameW(
-        hwnd,
-        cls,
-        ARRAYSIZE(cls)
-    );
-
-    if (
-        wcscmp(
-            cls,
-            L"CabinetWClass"
-        ) == 0 &&
-        IsWindowVisible(hwnd)
-    )
+    for (HWND current = hwnd; current; current = GetParent(current))
     {
-        ctx->hwnd = hwnd;
-        return FALSE;
+        wchar_t cls[128] = {};
+
+        if (
+            GetClassNameW(
+                current,
+                cls,
+                ARRAYSIZE(cls)
+            ) &&
+            wcscmp(cls, className) == 0
+        )
+        {
+            return current;
+        }
     }
 
-    return TRUE;
+    return nullptr;
 }
 
-static HWND FindCabinetWindow()
-{
-    FindCabinetContext ctx{
-        g_pid,
-        nullptr
-    };
-
-    EnumWindows(
-        FindCabinetProc,
-        reinterpret_cast<LPARAM>(
-            &ctx
-        )
-    );
-
-    return ctx.hwnd;
-}
-
-static IShellBrowser* TryGetShellBrowser(
-    HWND hwnd
+static IShellBrowser* TryGetShellBrowserOnOwnerThread(
+    HWND shellTab
 )
 {
-    if (!hwnd)
+    if (!shellTab)
         return nullptr;
+
+    const DWORD ownerThread =
+        GetWindowThreadProcessId(
+            shellTab,
+            nullptr
+        );
+
+    if (
+        !ownerThread ||
+        ownerThread != GetCurrentThreadId()
+    )
+    {
+        return nullptr;
+    }
 
     auto* browser =
         reinterpret_cast<IShellBrowser*>(
             SendMessageW(
-                hwnd,
+                shellTab,
                 CWM_GETISHELLBROWSER,
                 0,
                 0
@@ -1047,47 +1181,774 @@ static IShellBrowser* TryGetShellBrowser(
     return browser;
 }
 
+static HRESULT CreateGlobalInterfaceTable(
+    IGlobalInterfaceTable** table
+)
+{
+    if (!table)
+        return E_POINTER;
+
+    *table = nullptr;
+
+    return CoCreateInstance(
+        CLSID_StdGlobalInterfaceTable,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(table)
+    );
+}
+
+static void RevokeShellBrowserCookie(
+    DWORD cookie
+)
+{
+    if (!cookie)
+        return;
+
+    // Most revocations run on an Explorer UI apartment, but teardown can also
+    // reach this helper after a window has already disappeared. Ensure COM is
+    // available on that fallback thread without changing an existing apartment.
+    const HRESULT initHr =
+        CoInitializeEx(
+            nullptr,
+            COINIT_MULTITHREADED
+        );
+
+    const bool shouldUninitialize =
+        SUCCEEDED(initHr);
+
+    if (
+        FAILED(initHr) &&
+        initHr != RPC_E_CHANGED_MODE
+    )
+    {
+        Wh_Log(
+            L"Shell browser revoke COM setup failed cookie=%lu HRESULT=0x%08X",
+            cookie,
+            static_cast<unsigned>(initHr)
+        );
+        return;
+    }
+
+    IGlobalInterfaceTable* table = nullptr;
+    const HRESULT createHr =
+        CreateGlobalInterfaceTable(&table);
+
+    if (FAILED(createHr) || !table)
+    {
+        Wh_Log(
+            L"Global Interface Table revoke setup failed cookie=%lu HRESULT=0x%08X",
+            cookie,
+            static_cast<unsigned>(createHr)
+        );
+
+        if (shouldUninitialize)
+            CoUninitialize();
+
+        return;
+    }
+
+    const HRESULT revokeHr =
+        table->RevokeInterfaceFromGlobal(cookie);
+
+    table->Release();
+
+    if (shouldUninitialize)
+        CoUninitialize();
+
+    if (FAILED(revokeHr))
+    {
+        Wh_Log(
+            L"Shell browser revoke failed cookie=%lu HRESULT=0x%08X",
+            cookie,
+            static_cast<unsigned>(revokeHr)
+        );
+    }
+}
+
+static bool EnsureShellBrowserRegistration(
+    HWND hwnd
+)
+{
+    if (
+        !hwnd ||
+        g_unloading.load(std::memory_order_acquire)
+    )
+    {
+        return false;
+    }
+
+    const DWORD ownerThread =
+        GetWindowThreadProcessId(
+            hwnd,
+            nullptr
+        );
+
+    if (
+        !ownerThread ||
+        ownerThread != GetCurrentThreadId()
+    )
+    {
+        return false;
+    }
+
+    HWND shellTab =
+        FindAncestorByClass(
+            hwnd,
+            L"ShellTabWindowClass"
+        );
+
+    if (!shellTab)
+        return false;
+
+    AcquireSRWLockShared(&g_subclassLock);
+
+    const auto existing =
+        std::find_if(
+            g_trackedWindows.begin(),
+            g_trackedWindows.end(),
+            [&](const TrackedDirectUiState& value)
+            {
+                return value.hwnd == hwnd;
+            }
+        );
+
+    const bool alreadyRegistered =
+        existing != g_trackedWindows.end() &&
+        existing->shellTab == shellTab &&
+        existing->shellBrowserCookie != 0;
+
+    ReleaseSRWLockShared(&g_subclassLock);
+
+    if (alreadyRegistered)
+        return true;
+
+    IShellBrowser* browser =
+        TryGetShellBrowserOnOwnerThread(shellTab);
+
+    if (!browser)
+        return false;
+
+    IGlobalInterfaceTable* table = nullptr;
+    HRESULT hr =
+        CreateGlobalInterfaceTable(&table);
+
+    DWORD newCookie = 0;
+
+    if (SUCCEEDED(hr) && table)
+    {
+        hr =
+            table->RegisterInterfaceInGlobal(
+                browser,
+                IID_IShellBrowser,
+                &newCookie
+            );
+    }
+
+    browser->Release();
+
+    if (table)
+        table->Release();
+
+    if (FAILED(hr) || !newCookie)
+    {
+        Wh_Log(
+            L"Shell browser registration failed hwnd=%p HRESULT=0x%08X",
+            hwnd,
+            static_cast<unsigned>(hr)
+        );
+        return false;
+    }
+
+    DWORD oldCookie = 0;
+    bool stored = false;
+
+    AcquireSRWLockExclusive(&g_subclassLock);
+
+    auto tracked =
+        std::find_if(
+            g_trackedWindows.begin(),
+            g_trackedWindows.end(),
+            [&](const TrackedDirectUiState& value)
+            {
+                return value.hwnd == hwnd;
+            }
+        );
+
+    if (
+        tracked != g_trackedWindows.end() &&
+        !g_unloading.load(std::memory_order_acquire)
+    )
+    {
+        oldCookie = tracked->shellBrowserCookie;
+        tracked->shellTab = shellTab;
+        tracked->shellBrowserCookie = newCookie;
+        stored = true;
+    }
+
+    ReleaseSRWLockExclusive(&g_subclassLock);
+
+    if (oldCookie)
+        RevokeShellBrowserCookie(oldCookie);
+
+    if (!stored)
+    {
+        RevokeShellBrowserCookie(newCookie);
+        return false;
+    }
+
+    if (g_workerWakeEvent)
+        SetEvent(g_workerWakeEvent);
+
+    return true;
+}
+
 // ============================================================
 // Redraw
 // ============================================================
 
-static void RefreshInfoBar()
+static int ScaleForWindow(
+    HWND hwnd,
+    int value
+)
 {
-    HWND hwnd =
-        g_lastDirectUiHwnd.load(
-            std::memory_order_relaxed
-        );
+    const UINT dpi =
+        hwnd ? GetDpiForWindow(hwnd) : 96;
 
-    if (!hwnd || !IsWindow(hwnd))
-        return;
+    return MulDiv(
+        value,
+        dpi ? static_cast<int>(dpi) : 96,
+        96
+    );
+}
+
+static bool GetBottomStatusRowRect(
+    HWND hwnd,
+    RECT* row
+)
+{
+    if (!hwnd || !row || !IsWindow(hwnd))
+        return false;
 
     RECT client{};
 
     if (!GetClientRect(hwnd, &client))
-        return;
+        return false;
 
-    RECT row =
-        client;
-
-    row.top =
-        client.bottom > kStatusRowHeight
-            ? client.bottom - kStatusRowHeight
+    *row = client;
+    row->top =
+        client.bottom > ScaleForWindow(hwnd, kStatusRowHeight)
+            ? client.bottom - ScaleForWindow(hwnd, kStatusRowHeight)
             : 0;
+
+    return true;
+}
+
+static bool InvalidateInfoBarWindow(
+    HWND hwnd,
+    int partialLeft = -1,
+    int partialRight = -1
+)
+{
+    if (!hwnd || !IsWindow(hwnd))
+        return false;
+
+    RECT row{};
+
+    if (!GetBottomStatusRowRect(hwnd, &row))
+        return false;
+
+    const int clientRight =
+        row.right;
+
+    if (
+        partialLeft >= 0 &&
+        partialRight > partialLeft
+    )
+    {
+        row.left =
+            std::min(
+                std::max(partialLeft, 0),
+                clientRight
+            );
+
+        row.right =
+            std::min(
+                partialRight,
+                clientRight
+            );
+
+        if (row.right <= row.left)
+            return false;
+    }
 
     // Ask DirectUI to repaint only the bottom row.
     // Our subclass paints our info after DirectUI finishes its own WM_PAINT.
-    InvalidateRect(
+    return InvalidateRect(
+               hwnd,
+               &row,
+               FALSE
+           ) != FALSE;
+}
+
+static size_t GetSectionGeometryIndex(
+    InfoBarSection section
+)
+{
+    if (section == InfoBarSection::Drive)
+        return 0;
+
+    if (section == InfoBarSection::Content)
+        return 1;
+
+    return 2;
+}
+
+struct StableThemeSnapshot
+{
+    COLORREF rowBackground = CLR_INVALID;
+    COLORREF nativeTextColor = CLR_INVALID;
+};
+
+static void StoreLayoutGeometry(
+    const InfoBarLayoutGeometry& geometry
+)
+{
+    AcquireSRWLockExclusive(&g_subclassLock);
+
+    auto existing =
+        std::find_if(
+            g_trackedWindows.begin(),
+            g_trackedWindows.end(),
+            [&](const TrackedDirectUiState& value)
+            {
+                return value.hwnd == geometry.hwnd;
+            }
+        );
+
+    if (existing != g_trackedWindows.end())
+    {
+        existing->layout = geometry;
+        existing->hasLayout = true;
+    }
+
+    ReleaseSRWLockExclusive(&g_subclassLock);
+}
+
+static DWORD UntrackDirectUiWindowLocked(
+    HWND hwnd
+)
+{
+    DWORD shellBrowserCookie = 0;
+
+    const auto existing =
+        std::find_if(
+            g_trackedWindows.begin(),
+            g_trackedWindows.end(),
+            [&](const TrackedDirectUiState& value)
+            {
+                return value.hwnd == hwnd;
+            }
+        );
+
+    if (existing != g_trackedWindows.end())
+    {
+        shellBrowserCookie =
+            existing->shellBrowserCookie;
+
+        g_trackedWindows.erase(existing);
+    }
+
+    return shellBrowserCookie;
+}
+
+static DWORD GetShellBrowserCookieSnapshot(
+    HWND hwnd
+)
+{
+    DWORD cookie = 0;
+
+    AcquireSRWLockShared(&g_subclassLock);
+
+    const auto existing =
+        std::find_if(
+            g_trackedWindows.begin(),
+            g_trackedWindows.end(),
+            [&](const TrackedDirectUiState& value)
+            {
+                return value.hwnd == hwnd;
+            }
+        );
+
+    if (existing != g_trackedWindows.end())
+        cookie = existing->shellBrowserCookie;
+
+    ReleaseSRWLockShared(&g_subclassLock);
+    return cookie;
+}
+
+static StableThemeSnapshot GetStableThemeStateSnapshot(
+    HWND hwnd
+)
+{
+    StableThemeSnapshot result;
+
+    AcquireSRWLockShared(&g_subclassLock);
+
+    const auto existing =
+        std::find_if(
+            g_trackedWindows.begin(),
+            g_trackedWindows.end(),
+            [&](const TrackedDirectUiState& value)
+            {
+                return value.hwnd == hwnd;
+            }
+        );
+
+    if (existing != g_trackedWindows.end())
+    {
+        result.rowBackground =
+            existing->stableRowBackground;
+
+        result.nativeTextColor =
+            existing->stableNativeTextColor;
+    }
+
+    ReleaseSRWLockShared(&g_subclassLock);
+    return result;
+}
+
+static void UpdateStableThemeState(
+    HWND hwnd,
+    COLORREF rowBackground,
+    bool updateBackground,
+    COLORREF nativeTextColor,
+    bool updateTextColor
+)
+{
+    AcquireSRWLockExclusive(&g_subclassLock);
+
+    auto existing =
+        std::find_if(
+            g_trackedWindows.begin(),
+            g_trackedWindows.end(),
+            [&](const TrackedDirectUiState& value)
+            {
+                return value.hwnd == hwnd;
+            }
+        );
+
+    if (existing != g_trackedWindows.end())
+    {
+        if (updateBackground)
+            existing->stableRowBackground = rowBackground;
+
+        if (updateTextColor)
+            existing->stableNativeTextColor = nativeTextColor;
+    }
+
+    ReleaseSRWLockExclusive(&g_subclassLock);
+}
+
+static void RefreshInfoBarWindow(
+    HWND hwnd,
+    unsigned changes = CacheChangeNone
+)
+{
+    if (!hwnd || !IsWindow(hwnd))
+        return;
+
+    if (changes == CacheChangeNone)
+    {
+        InvalidateInfoBarWindow(hwnd);
+        return;
+    }
+
+    InfoBarLayoutGeometry geometry;
+    bool hasGeometry = false;
+
+    AcquireSRWLockShared(&g_subclassLock);
+
+    const auto tracked =
+        std::find_if(
+            g_trackedWindows.begin(),
+            g_trackedWindows.end(),
+            [&](const TrackedDirectUiState& value)
+            {
+                return value.hwnd == hwnd;
+            }
+        );
+
+    const bool found =
+        tracked != g_trackedWindows.end();
+
+    if (found)
+    {
+        geometry = tracked->layout;
+        hasGeometry = tracked->hasLayout;
+    }
+
+    ReleaseSRWLockShared(&g_subclassLock);
+
+    if (!found)
+        return;
+
+    const ModSettings settings =
+        GetSettingsSnapshot();
+
+    unsigned visibleChanges = changes;
+
+    if (!settings.showDrive)
+        visibleChanges &= ~CacheChangeDrive;
+
+    if (!settings.showContent)
+        visibleChanges &= ~CacheChangeContent;
+
+    if (!settings.showSelection)
+        visibleChanges &= ~CacheChangeSelection;
+
+    if (!settings.singleFileDetails)
+        visibleChanges &= ~CacheChangeFileDetails;
+
+    if (visibleChanges == CacheChangeNone)
+        return;
+
+    RECT client{};
+
+    const bool currentClientAvailable =
+        GetClientRect(
+            hwnd,
+            &client
+        );
+
+    const int currentUsableRight =
+        currentClientAvailable
+            ? (
+                client.right > ScaleForWindow(hwnd, 220)
+                    ? static_cast<int>(
+                        client.right - ScaleForWindow(hwnd, 220)
+                    )
+                    : static_cast<int>(client.right)
+            )
+            : -1;
+
+    const bool layoutMatchesSettings =
+        hasGeometry &&
+        geometry.style == settings.style &&
+        geometry.sectionOrder == settings.sectionOrder &&
+        geometry.showDrive == settings.showDrive &&
+        geometry.showContent == settings.showContent &&
+        geometry.showSelection == settings.showSelection &&
+        geometry.singleFileDetails == settings.singleFileDetails &&
+        geometry.usableRight == currentUsableRight;
+
+    if (!layoutMatchesSettings)
+    {
+        InvalidateInfoBarWindow(hwnd);
+        return;
+    }
+
+    int partialLeft = -1;
+
+    auto IncludeLeft =
+        [&](int left)
+        {
+            if (left < 0)
+                return false;
+
+            if (
+                partialLeft < 0 ||
+                left < partialLeft
+            )
+            {
+                partialLeft = left;
+            }
+
+            return true;
+        };
+
+    bool geometryComplete = true;
+
+    if (visibleChanges & CacheChangeDrive)
+    {
+        geometryComplete &=
+            IncludeLeft(
+                geometry.sectionLeft[
+                    GetSectionGeometryIndex(
+                        InfoBarSection::Drive
+                    )
+                ]
+            );
+    }
+
+    if (visibleChanges & CacheChangeContent)
+    {
+        geometryComplete &=
+            IncludeLeft(
+                geometry.sectionLeft[
+                    GetSectionGeometryIndex(
+                        InfoBarSection::Content
+                    )
+                ]
+            );
+    }
+
+    if (visibleChanges & CacheChangeSelection)
+    {
+        geometryComplete &=
+            IncludeLeft(
+                geometry.sectionLeft[
+                    GetSectionGeometryIndex(
+                        InfoBarSection::Selection
+                    )
+                ]
+            );
+    }
+
+    if (visibleChanges & CacheChangeFileDetails)
+    {
+        geometryComplete &=
+            IncludeLeft(
+                geometry.fileDetailsLeft
+            );
+    }
+
+    if (
+        !geometryComplete ||
+        partialLeft < 0 ||
+        geometry.usableRight <= partialLeft
+    )
+    {
+        InvalidateInfoBarWindow(hwnd);
+        return;
+    }
+
+    InvalidateInfoBarWindow(
         hwnd,
-        &row,
-        FALSE
+        partialLeft,
+        geometry.usableRight
     );
+}
+
+static void RefreshInfoBars(
+    unsigned changes = CacheChangeNone
+)
+{
+    std::vector<HWND> windows;
+
+    AcquireSRWLockShared(&g_subclassLock);
+
+    try
+    {
+        windows.reserve(g_trackedWindows.size());
+
+        for (const TrackedDirectUiState& state : g_trackedWindows)
+            windows.push_back(state.hwnd);
+    }
+    catch (...)
+    {
+        ReleaseSRWLockShared(&g_subclassLock);
+        Wh_Log(L"DirectUI refresh snapshot failed");
+        return;
+    }
+
+    ReleaseSRWLockShared(&g_subclassLock);
+
+    for (HWND hwnd : windows)
+        RefreshInfoBarWindow(hwnd, changes);
 }
 
 // ============================================================
 // Cache
 // ============================================================
 
+static WindowDataCache* FindWindowDataCacheLocked(
+    HWND hwnd
+)
+{
+    const auto existing =
+        std::find_if(
+            g_windowDataCaches.begin(),
+            g_windowDataCaches.end(),
+            [&](const WindowDataCache& value)
+            {
+                return value.hwnd == hwnd;
+            }
+        );
+
+    return existing != g_windowDataCaches.end()
+        ? &*existing
+        : nullptr;
+}
+
+static bool EnsureWindowDataCache(
+    HWND hwnd
+)
+{
+    EnterCriticalSection(&g_cacheLock);
+
+    if (FindWindowDataCacheLocked(hwnd))
+    {
+        LeaveCriticalSection(&g_cacheLock);
+        return true;
+    }
+
+    try
+    {
+        WindowDataCache cache;
+        cache.hwnd = hwnd;
+        g_windowDataCaches.push_back(std::move(cache));
+    }
+    catch (...)
+    {
+        LeaveCriticalSection(&g_cacheLock);
+        Wh_Log(L"Window data cache allocation failed hwnd=%p", hwnd);
+        return false;
+    }
+
+    LeaveCriticalSection(&g_cacheLock);
+    return true;
+}
+
+static void EraseWindowDataCache(
+    HWND hwnd
+)
+{
+    EnterCriticalSection(&g_cacheLock);
+
+    g_windowDataCaches.erase(
+        std::remove_if(
+            g_windowDataCaches.begin(),
+            g_windowDataCaches.end(),
+            [&](const WindowDataCache& value)
+            {
+                return value.hwnd == hwnd;
+            }
+        ),
+        g_windowDataCaches.end()
+    );
+
+    LeaveCriticalSection(&g_cacheLock);
+}
+
+static WindowDataCache GetWindowDataCacheSnapshot(
+    HWND hwnd
+)
+{
+    WindowDataCache result;
+    result.hwnd = hwnd;
+
+    EnterCriticalSection(&g_cacheLock);
+
+    if (WindowDataCache* existing = FindWindowDataCacheLocked(hwnd))
+        result = *existing;
+
+    LeaveCriticalSection(&g_cacheLock);
+    return result;
+}
+
 static void GetCachedGroups(
+    HWND hwnd,
     std::wstring& contentGroup,
     std::wstring& selectionGroup,
     std::wstring& driveGroup,
@@ -1095,54 +1956,47 @@ static void GetCachedGroups(
     int& selected
 )
 {
-    EnterCriticalSection(
-        &g_cacheLock
-    );
+    EnterCriticalSection(&g_cacheLock);
 
-    contentGroup =
-        g_contentGroup;
+    if (WindowDataCache* cache = FindWindowDataCacheLocked(hwnd))
+    {
+        contentGroup = cache->contentGroup;
+        selectionGroup = cache->selectionGroup;
+        driveGroup = cache->driveGroup;
+        fileDetailsGroup = cache->fileDetailsGroup;
+        selected = cache->selected;
+    }
+    else
+    {
+        contentGroup = L"Loading...";
+        selectionGroup.clear();
+        driveGroup.clear();
+        fileDetailsGroup.clear();
+        selected = 0;
+    }
 
-    selectionGroup =
-        g_selectionGroup;
-
-    driveGroup =
-        g_driveGroup;
-
-    fileDetailsGroup =
-        g_fileDetailsGroup;
-
-    selected =
-        g_selected;
-
-    LeaveCriticalSection(
-        &g_cacheLock
-    );
+    LeaveCriticalSection(&g_cacheLock);
 }
 
-static bool UpdateCache(
+static unsigned UpdateCache(
+    HWND hwnd,
     int files,
     int folders,
-
     int selected,
     int selectedFiles,
     int selectedFolders,
-
     ULONGLONG directFileBytes,
     ULONGLONG selectedBytes,
-
     ULONGLONG freeBytes,
     ULONGLONG driveTotalBytes,
-
     wchar_t driveLetter,
-
-    const std::wstring& path,
-    const std::wstring& fileDetailsText
+    const std::wstring& contentOverrideText,
+    const std::wstring& selectionOverrideText,
+    const std::wstring& fileDetailsText,
+    const ContentRefreshCache& contentRefreshCache,
+    const SingleFileMetadataCache& metadataCache
 )
 {
-    // --------------------------------------------------------
-    // Drive
-    // --------------------------------------------------------
-
     std::wstring driveText;
 
     if (
@@ -1157,242 +2011,374 @@ static bool UpdateCache(
             ARRAYSIZE(driveBuf),
             L"Drive %c: %s free",
             driveLetter,
-            FormatBytes(freeBytes, ByteFormat::OneDecimal).c_str()
+            FormatBytes(
+                freeBytes,
+                ByteFormat::OneDecimal
+            ).c_str()
         );
 
         driveText = driveBuf;
     }
 
-    // --------------------------------------------------------
-    // Content
-    // --------------------------------------------------------
+    std::wstring contentText;
 
-    wchar_t contentBuf[256] = {};
+    if (!contentOverrideText.empty())
+    {
+        contentText = contentOverrideText;
+    }
+    else
+    {
+        wchar_t contentBuf[256] = {};
 
-    swprintf(
-        contentBuf,
-        ARRAYSIZE(contentBuf),
-        L"Content: %d folder%s / %d file%s (%s)",
-        folders,
-        folders == 1 ? L"" : L"s",
-        files,
-        files == 1 ? L"" : L"s",
-        FormatBytes(directFileBytes).c_str()
-    );
+        swprintf(
+            contentBuf,
+            ARRAYSIZE(contentBuf),
+            L"Content: %d folder%s / %d file%s (%s)",
+            folders,
+            folders == 1 ? L"" : L"s",
+            files,
+            files == 1 ? L"" : L"s",
+            FormatBytes(directFileBytes).c_str()
+        );
 
-    std::wstring contentText =
-        contentBuf;
-
-    // --------------------------------------------------------
-    // Selection
-    // --------------------------------------------------------
+        contentText = contentBuf;
+    }
 
     std::wstring selectionText;
 
     if (selected > 0)
     {
-        wchar_t selectedBuf[256] = {};
-
-        if (
-            selectedFolders > 0 &&
-            selectedFiles > 0
-        )
+        if (!selectionOverrideText.empty())
         {
-            swprintf(
-                selectedBuf,
-                ARRAYSIZE(selectedBuf),
-                L"Selected: %d folder%s / %d file%s (%s)",
-                selectedFolders,
-                selectedFolders == 1 ? L"" : L"s",
-                selectedFiles,
-                selectedFiles == 1 ? L"" : L"s",
-                FormatBytes(selectedBytes).c_str()
-            );
-        }
-        else if (selectedFolders > 0)
-        {
-            swprintf(
-                selectedBuf,
-                ARRAYSIZE(selectedBuf),
-                L"Selected: %d folder%s",
-                selectedFolders,
-                selectedFolders == 1 ? L"" : L"s"
-            );
+            selectionText = selectionOverrideText;
         }
         else
         {
-            swprintf(
-                selectedBuf,
-                ARRAYSIZE(selectedBuf),
-                L"Selected: %d file%s (%s)",
-                selectedFiles,
-                selectedFiles == 1 ? L"" : L"s",
-                FormatBytes(selectedBytes).c_str()
-            );
-        }
+            wchar_t selectedBuf[256] = {};
 
-        selectionText = selectedBuf;
+            if (
+                selectedFolders > 0 &&
+                selectedFiles > 0
+            )
+            {
+                swprintf(
+                    selectedBuf,
+                    ARRAYSIZE(selectedBuf),
+                    L"Selected: %d folder%s / %d file%s (%s)",
+                    selectedFolders,
+                    selectedFolders == 1 ? L"" : L"s",
+                    selectedFiles,
+                    selectedFiles == 1 ? L"" : L"s",
+                    FormatBytes(selectedBytes).c_str()
+                );
+            }
+            else if (selectedFolders > 0)
+            {
+                swprintf(
+                    selectedBuf,
+                    ARRAYSIZE(selectedBuf),
+                    L"Selected: %d folder%s",
+                    selectedFolders,
+                    selectedFolders == 1 ? L"" : L"s"
+                );
+            }
+            else
+            {
+                swprintf(
+                    selectedBuf,
+                    ARRAYSIZE(selectedBuf),
+                    L"Selected: %d file%s (%s)",
+                    selectedFiles,
+                    selectedFiles == 1 ? L"" : L"s",
+                    FormatBytes(selectedBytes).c_str()
+                );
+            }
+
+            selectionText = selectedBuf;
+        }
     }
 
-    bool changed = false;
+    unsigned changes = CacheChangeNone;
 
-    EnterCriticalSection(
-        &g_cacheLock
-    );
+    EnterCriticalSection(&g_cacheLock);
+
+    WindowDataCache* cache =
+        FindWindowDataCacheLocked(hwnd);
+
+    if (!cache)
+    {
+        // Cache creation belongs to the tracked-window lifecycle. Don't
+        // recreate a cache here if this worker iteration raced with window
+        // destruction and cleanup.
+        LeaveCriticalSection(&g_cacheLock);
+        return CacheChangeNone;
+    }
+
+    if (contentText != cache->contentGroup)
+    {
+        changes |= CacheChangeContent;
+        cache->contentGroup = contentText;
+    }
 
     if (
-        contentText != g_contentGroup ||
-        selectionText != g_selectionGroup ||
-        driveText != g_driveGroup ||
-        fileDetailsText != g_fileDetailsGroup ||
-        selected != g_selected
+        selectionText != cache->selectionGroup ||
+        selected != cache->selected
     )
     {
-        changed = true;
-
-        g_selected =
-            selected;
-
-        g_contentGroup =
-            contentText;
-
-        g_selectionGroup =
-            selectionText;
-
-        g_driveGroup =
-            driveText;
-
-        g_fileDetailsGroup =
-            fileDetailsText;
+        changes |= CacheChangeSelection;
+        cache->selected = selected;
+        cache->selectionGroup = selectionText;
     }
 
-    LeaveCriticalSection(
-        &g_cacheLock
-    );
-
-    if (changed)
+    if (driveText != cache->driveGroup)
     {
-        Wh_Log(
-            L"INFOBAR path='%s' "
-            L"folders=%d files=%d "
-            L"selected=%d %dF/%dD "
-            L"fileBytes=%llu selectedBytes=%llu "
-            L"drive=%c free=%llu total=%llu",
-
-            path.c_str(),
-
-            folders,
-            files,
-
-            selected,
-            selectedFiles,
-            selectedFolders,
-
-            directFileBytes,
-            selectedBytes,
-
-            driveLetter,
-            freeBytes,
-            driveTotalBytes
-        );
+        changes |= CacheChangeDrive;
+        cache->driveGroup = driveText;
     }
 
-    return changed;
+    if (fileDetailsText != cache->fileDetailsGroup)
+    {
+        changes |= CacheChangeFileDetails;
+        cache->fileDetailsGroup = fileDetailsText;
+    }
+
+    cache->contentRefresh = contentRefreshCache;
+    cache->metadata = metadataCache;
+
+    LeaveCriticalSection(&g_cacheLock);
+    return changes;
+}
+
+static bool ScanFilesystemDirectory(
+    const std::wstring& directoryPath,
+    int* files,
+    int* folders,
+    ULONGLONG* directFileBytes
+)
+{
+    if (
+        directoryPath.empty() ||
+        !files ||
+        !folders ||
+        !directFileBytes
+    )
+    {
+        return false;
+    }
+
+    std::wstring searchPath = directoryPath;
+
+    if (
+        searchPath.back() != L'\\' &&
+        searchPath.back() != L'/'
+    )
+    {
+        searchPath += L'\\';
+    }
+
+    searchPath += L'*';
+
+    WIN32_FIND_DATAW findData{};
+
+    HANDLE findHandle =
+        FindFirstFileExW(
+            searchPath.c_str(),
+            FindExInfoBasic,
+            &findData,
+            FindExSearchNameMatch,
+            nullptr,
+            FIND_FIRST_EX_LARGE_FETCH
+        );
+
+    if (findHandle == INVALID_HANDLE_VALUE)
+    {
+        const DWORD error = GetLastError();
+
+        if (
+            error == ERROR_FILE_NOT_FOUND ||
+            error == ERROR_NO_MORE_FILES
+        )
+        {
+            *files = 0;
+            *folders = 0;
+            *directFileBytes = 0;
+            return true;
+        }
+
+        return false;
+    }
+
+    int scannedFiles = 0;
+    int scannedFolders = 0;
+    ULONGLONG scannedBytes = 0;
+    bool complete = true;
+
+    while (true)
+    {
+        if (
+            g_unloading.load(std::memory_order_acquire) ||
+            (
+                g_stopEvent &&
+                WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0
+            )
+        )
+        {
+            complete = false;
+            break;
+        }
+
+        if (
+            wcscmp(findData.cFileName, L".") != 0 &&
+            wcscmp(findData.cFileName, L"..") != 0
+        )
+        {
+            if (
+                findData.dwFileAttributes &
+                FILE_ATTRIBUTE_DIRECTORY
+            )
+            {
+                scannedFolders++;
+            }
+            else
+            {
+                scannedFiles++;
+
+                scannedBytes +=
+                    (static_cast<ULONGLONG>(
+                        findData.nFileSizeHigh
+                    ) << 32) |
+                    findData.nFileSizeLow;
+            }
+        }
+
+        if (FindNextFileW(findHandle, &findData))
+            continue;
+
+        if (GetLastError() != ERROR_NO_MORE_FILES)
+            complete = false;
+
+        break;
+    }
+
+    FindClose(findHandle);
+
+    if (!complete)
+        return false;
+
+    *files = scannedFiles;
+    *folders = scannedFolders;
+    *directFileBytes = scannedBytes;
+    return true;
+}
+
+static void ClearSingleFileMetadataCache(
+    SingleFileMetadataCache* cache
+)
+{
+    if (cache)
+        *cache = SingleFileMetadataCache{};
+}
+
+static std::wstring GetSingleFileDetailsCached(
+    SingleFileMetadataCache* cache,
+    IShellItem* item,
+    const std::wstring& path
+)
+{
+    if (!cache)
+        return L"";
+
+    const ULONGLONG now = GetTickCount64();
+
+    if (path == cache->path)
+    {
+        if (cache->valid)
+            return cache->details;
+
+        if (cache->retryAfterTick > now)
+            return cache->details;
+    }
+
+    bool transientFailure = false;
+
+    std::wstring details =
+        BuildSingleFileDetails(
+            item,
+            path,
+            &transientFailure
+        );
+
+    cache->path = path;
+    cache->details = details;
+    cache->valid = !transientFailure;
+    cache->retryAfterTick =
+        transientFailure
+            ? now + kMetadataRetryMs
+            : 0;
+
+    return details;
 }
 
 // ============================================================
 // Read Explorer state
 // ============================================================
 
-static bool ReadCurrentView()
+static unsigned ReadCurrentView(
+    HWND hwnd,
+    IShellBrowser* browser
+)
 {
-    HWND cabinet =
-        FindCabinetWindow();
+    if (!hwnd || !browser)
+        return CacheChangeNone;
 
-    if (!cabinet)
-        return false;
+    const ModSettings settings =
+        GetSettingsSnapshot();
 
-    HWND tab =
-        FindWindowExW(
-            cabinet,
-            nullptr,
-            L"ShellTabWindowClass",
-            nullptr
-        );
+    WindowDataCache state =
+        GetWindowDataCacheSnapshot(hwnd);
 
-    if (!tab)
-        return false;
+    ContentRefreshCache contentCache =
+        state.contentRefresh;
 
-    IShellBrowser* browser =
-        TryGetShellBrowser(
-            tab
-        );
+    SingleFileMetadataCache metadataCache =
+        state.metadata;
 
-    if (!browser)
-        return false;
-
-    IShellView* shellView =
-        nullptr;
+    IShellView* shellView = nullptr;
 
     HRESULT hr =
         browser->QueryActiveShellView(
             &shellView
         );
 
-    if (
-        FAILED(hr) ||
-        !shellView
-    )
-    {
-        browser->Release();
+    if (FAILED(hr) || !shellView)
+        return CacheChangeNone;
 
-        return false;
-    }
-
-    IFolderView2* folderView =
-        nullptr;
+    IFolderView2* folderView = nullptr;
 
     hr =
         shellView->QueryInterface(
-            IID_PPV_ARGS(
-                &folderView
-            )
+            IID_PPV_ARGS(&folderView)
         );
 
-    if (
-        FAILED(hr) ||
-        !folderView
-    )
+    if (FAILED(hr) || !folderView)
     {
         shellView->Release();
-        browser->Release();
-
-        return false;
+        return CacheChangeNone;
     }
 
-    // ========================================================
-    // Current folder path
-    // ========================================================
-
     std::wstring currentPath;
+    std::wstring folderIdentity;
 
-    IShellItem* folderItem =
-        nullptr;
+    IShellItem* folderItem = nullptr;
 
     hr =
         folderView->GetFolder(
-            IID_PPV_ARGS(
-                &folderItem
-            )
+            IID_PPV_ARGS(&folderItem)
         );
 
-    if (
-        SUCCEEDED(hr) &&
-        folderItem
-    )
+    if (SUCCEEDED(hr) && folderItem)
     {
-        PWSTR path =
-            nullptr;
+        PWSTR path = nullptr;
 
         if (
             SUCCEEDED(
@@ -1404,233 +2390,205 @@ static bool ReadCurrentView()
             path
         )
         {
-            currentPath =
-                path;
+            currentPath = path;
+            CoTaskMemFree(path);
+        }
 
-            CoTaskMemFree(
-                path
-            );
+        PWSTR parsingName = nullptr;
+
+        if (
+            SUCCEEDED(
+                folderItem->GetDisplayName(
+                    SIGDN_DESKTOPABSOLUTEPARSING,
+                    &parsingName
+                )
+            ) &&
+            parsingName
+        )
+        {
+            folderIdentity = parsingName;
+            CoTaskMemFree(parsingName);
         }
 
         folderItem->Release();
     }
 
-    // ========================================================
-    // Drive
-    // ========================================================
+    if (folderIdentity.empty())
+        folderIdentity = currentPath;
 
-    ULONGLONG freeBytes =
-        0;
+    ULONGLONG freeBytes = 0;
+    ULONGLONG driveTotalBytes = 0;
+    wchar_t driveLetter = L'?';
 
-    ULONGLONG driveTotalBytes =
-        0;
-
-    wchar_t driveLetter =
-        L'?';
-
-    if (!currentPath.empty())
+    if (
+        settings.showDrive &&
+        currentPath.length() >= 2 &&
+        currentPath[1] == L':'
+    )
     {
         ULARGE_INTEGER freeAvailable{};
         ULARGE_INTEGER totalBytes{};
-        ULARGE_INTEGER totalFree{};
 
         if (
             GetDiskFreeSpaceExW(
                 currentPath.c_str(),
                 &freeAvailable,
                 &totalBytes,
-                &totalFree
+                nullptr
             )
         )
         {
-            freeBytes =
-                freeAvailable.QuadPart;
-
-            driveTotalBytes =
-                totalBytes.QuadPart;
+            freeBytes = freeAvailable.QuadPart;
+            driveTotalBytes = totalBytes.QuadPart;
         }
 
-        if (
-            currentPath.length() >= 2 &&
-            currentPath[1] == L':'
-        )
-        {
-            driveLetter =
-                static_cast<wchar_t>(
-                    towupper(
-                        currentPath[0]
-                    )
-                );
-        }
+        driveLetter =
+            static_cast<wchar_t>(
+                towupper(currentPath[0])
+            );
     }
 
-    // ========================================================
-    // Shell folder
-    // ========================================================
+    int total = -1;
+    bool itemCountAvailable = false;
+    std::wstring contentOverrideText;
 
-    IShellFolder* shellFolder =
-        nullptr;
+    if (settings.showContent)
+    {
+        hr =
+            folderView->ItemCount(
+                SVGIO_ALLVIEW,
+                &total
+            );
 
-    hr =
-        folderView->GetFolder(
-            IID_PPV_ARGS(
-                &shellFolder
-            )
-        );
+        itemCountAvailable = SUCCEEDED(hr);
+    }
+
+    const ULONGLONG now = GetTickCount64();
 
     if (
-        FAILED(hr) ||
-        !shellFolder
+        settings.showContent &&
+        itemCountAvailable &&
+        currentPath.empty()
     )
     {
-        folderView->Release();
-        shellView->Release();
-        browser->Release();
+        wchar_t virtualContent[128] = {};
 
-        return false;
-    }
-
-    // ========================================================
-    // Immediate directory contents
-    // ========================================================
-
-    int total =
-        0;
-
-    hr =
-        folderView->ItemCount(
-            SVGIO_ALLVIEW,
-            &total
+        swprintf(
+            virtualContent,
+            ARRAYSIZE(virtualContent),
+            L"Content: %d item%s",
+            total,
+            total == 1 ? L"" : L"s"
         );
 
-    int files =
-        0;
-
-    int folders =
-        0;
-
-    ULONGLONG directFileBytes =
-        0;
-
-    if (SUCCEEDED(hr))
+        contentOverrideText = virtualContent;
+    }
+    else if (
+        settings.showContent &&
+        itemCountAvailable &&
+        !currentPath.empty()
+    )
     {
-        for (
-            int i = 0;
-            i < total;
-            i++
+        const bool sameFolder =
+            contentCache.valid &&
+            !folderIdentity.empty() &&
+            folderIdentity == contentCache.folderIdentity;
+
+        const bool itemCountChanged =
+            sameFolder &&
+            total != contentCache.itemCount;
+
+        const bool safetyRescanDue =
+            sameFolder &&
+            now - contentCache.lastFullScanTick >=
+                kContentSafetyRescanMs;
+
+        const bool retryThrottled =
+            folderIdentity ==
+                contentCache.lastAttemptFolderIdentity &&
+            now - contentCache.lastScanAttemptTick <
+                kContentFailedRetryMs;
+
+        if (
+            (
+                !sameFolder ||
+                itemCountChanged ||
+                safetyRescanDue
+            ) &&
+            !retryThrottled
         )
         {
-            PITEMID_CHILD pidl =
-                nullptr;
+            contentCache.lastAttemptFolderIdentity = folderIdentity;
+            contentCache.lastScanAttemptTick = now;
+
+            int scannedFiles = 0;
+            int scannedFolders = 0;
+            ULONGLONG scannedBytes = 0;
 
             if (
-                FAILED(
-                    folderView->Item(
-                        i,
-                        &pidl
-                    )
-                ) ||
-                !pidl
-            )
-            {
-                continue;
-            }
-
-            IShellItem* item =
-                nullptr;
-
-            hr =
-                SHCreateItemWithParent(
-                    nullptr,
-                    shellFolder,
-                    pidl,
-                    IID_PPV_ARGS(
-                        &item
-                    )
-                );
-
-            if (
-                SUCCEEDED(hr) &&
-                item
-            )
-            {
-                PWSTR path =
-                    nullptr;
-
-                if (
-                    SUCCEEDED(
-                        item->GetDisplayName(
-                            SIGDN_FILESYSPATH,
-                            &path
-                        )
-                    ) &&
-                    path
+                ScanFilesystemDirectory(
+                    currentPath,
+                    &scannedFiles,
+                    &scannedFolders,
+                    &scannedBytes
                 )
-                {
-                    bool directory =
-                        false;
-
-                    ULONGLONG size =
-                        0;
-
-                    if (
-                        GetFilesystemInfo(
-                            path,
-                            &directory,
-                            &size
-                        )
-                    )
-                    {
-                        if (directory)
-                        {
-                            folders++;
-                        }
-                        else
-                        {
-                            files++;
-
-                            directFileBytes +=
-                                size;
-                        }
-                    }
-
-                    CoTaskMemFree(
-                        path
-                    );
-                }
-
-                item->Release();
+            )
+            {
+                contentCache.valid = true;
+                contentCache.folderIdentity = folderIdentity;
+                contentCache.itemCount = total;
+                contentCache.files = scannedFiles;
+                contentCache.folders = scannedFolders;
+                contentCache.directFileBytes = scannedBytes;
+                contentCache.lastFullScanTick = now;
             }
 
-            CoTaskMemFree(
-                pidl
-            );
         }
     }
 
-    // ========================================================
-    // Selection
-    // ========================================================
+    const bool useCachedContent =
+        settings.showContent &&
+        contentCache.valid &&
+        !folderIdentity.empty() &&
+        folderIdentity == contentCache.folderIdentity;
 
-    int selected =
-        0;
+    if (
+        settings.showContent &&
+        !currentPath.empty() &&
+        !useCachedContent &&
+        contentOverrideText.empty()
+    )
+    {
+        contentOverrideText = L"Content: Loading...";
+    }
 
-    int selectedFiles =
-        0;
+    const int files =
+        useCachedContent
+            ? contentCache.files
+            : 0;
 
-    int selectedFolders =
-        0;
+    const int folders =
+        useCachedContent
+            ? contentCache.folders
+            : 0;
 
-    ULONGLONG selectedBytes =
-        0;
+    const ULONGLONG directFileBytes =
+        useCachedContent
+            ? contentCache.directFileBytes
+            : 0;
 
+    int selected = 0;
+    int selectedFiles = 0;
+    int selectedFolders = 0;
+    ULONGLONG selectedBytes = 0;
+    std::wstring selectionOverrideText;
     std::wstring singleFileDetails;
+    bool keepSingleFileMetadataCache = false;
 
-    const ModSettings settings =
-        GetSettingsSnapshot();
-
-    IShellItemArray* selection =
-        nullptr;
+    // Always obtain the selection count. Even when the Selected and
+    // File Details sections are hidden, the painter uses the count to avoid
+    // learning Explorer's temporary selected-row tint as the normal theme.
+    IShellItemArray* selection = nullptr;
 
     hr =
         folderView->GetSelection(
@@ -1638,13 +2596,9 @@ static bool ReadCurrentView()
             &selection
         );
 
-    if (
-        SUCCEEDED(hr) &&
-        selection
-    )
+    if (SUCCEEDED(hr) && selection)
     {
-        DWORD selectionCount =
-            0;
+        DWORD selectionCount = 0;
 
         if (
             SUCCEEDED(
@@ -1655,132 +2609,190 @@ static bool ReadCurrentView()
         )
         {
             selected =
-                static_cast<int>(
-                    selectionCount
+                static_cast<int>(selectionCount);
+
+            const bool enumerateSelection =
+                settings.showSelection ||
+                (
+                    settings.singleFileDetails &&
+                    selectionCount == 1
                 );
 
-            for (
-                DWORD i = 0;
-                i < selectionCount;
-                i++
-            )
+            if (enumerateSelection)
             {
-                IShellItem* item =
-                    nullptr;
-
-                if (
-                    FAILED(
-                        selection->GetItemAt(
-                            i,
-                            &item
-                        )
-                    ) ||
-                    !item
-                )
+                for (DWORD i = 0; i < selectionCount; i++)
                 {
-                    continue;
-                }
-
-                PWSTR path =
-                    nullptr;
-
-                if (
-                    SUCCEEDED(
-                        item->GetDisplayName(
-                            SIGDN_FILESYSPATH,
-                            &path
-                        )
-                    ) &&
-                    path
-                )
-                {
-                    bool directory =
-                        false;
-
-                    ULONGLONG size =
-                        0;
-
                     if (
-                        GetFilesystemInfo(
-                            path,
-                            &directory,
-                            &size
+                        g_unloading.load(std::memory_order_acquire) ||
+                        (
+                            g_stopEvent &&
+                            WaitForSingleObject(
+                                g_stopEvent,
+                                0
+                            ) == WAIT_OBJECT_0
                         )
                     )
                     {
-                        if (directory)
-                        {
-                            selectedFolders++;
-                        }
-                        else
-                        {
-                            selectedFiles++;
+                        break;
+                    }
 
-                            selectedBytes +=
-                                size;
+                    IShellItem* item = nullptr;
 
-                            if (
-                                selectionCount == 1
+                    if (
+                        FAILED(
+                            selection->GetItemAt(
+                                i,
+                                &item
                             )
+                        ) ||
+                        !item
+                    )
+                    {
+                        continue;
+                    }
+
+                    PWSTR path = nullptr;
+
+                    if (
+                        SUCCEEDED(
+                            item->GetDisplayName(
+                                SIGDN_FILESYSPATH,
+                                &path
+                            )
+                        ) &&
+                        path
+                    )
+                    {
+                        bool directory = false;
+                        ULONGLONG size = 0;
+
+                        if (
+                            GetFilesystemInfo(
+                                path,
+                                &directory,
+                                &size
+                            )
+                        )
+                        {
+                            if (directory)
                             {
+                                selectedFolders++;
+                            }
+                            else
+                            {
+                                selectedFiles++;
+                                selectedBytes += size;
+
                                 if (
+                                    selectionCount == 1 &&
                                     settings.singleFileDetails
                                 )
                                 {
+                                    keepSingleFileMetadataCache = true;
                                     singleFileDetails =
-                                        BuildSingleFileDetails(
+                                        GetSingleFileDetailsCached(
+                                            &metadataCache,
                                             item,
                                             path
                                         );
                                 }
                             }
                         }
+
+                        CoTaskMemFree(path);
                     }
 
-                    CoTaskMemFree(
-                        path
-                    );
+                    item->Release();
                 }
-
-                item->Release();
             }
         }
 
         selection->Release();
     }
 
-    bool changed =
+    if (!keepSingleFileMetadataCache)
+        ClearSingleFileMetadataCache(&metadataCache);
+
+    if (
+        selected > 0 &&
+        selectedFiles + selectedFolders != selected
+    )
+    {
+        wchar_t virtualSelection[128] = {};
+
+        swprintf(
+            virtualSelection,
+            ARRAYSIZE(virtualSelection),
+            L"Selected: %d item%s",
+            selected,
+            selected == 1 ? L"" : L"s"
+        );
+
+        selectionOverrideText = virtualSelection;
+    }
+
+    if (
+        g_unloading.load(std::memory_order_acquire) ||
+        (
+            g_stopEvent &&
+            WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0
+        )
+    )
+    {
+        folderView->Release();
+        shellView->Release();
+        return CacheChangeNone;
+    }
+
+    const unsigned changes =
         UpdateCache(
+            hwnd,
             files,
             folders,
-
             selected,
             selectedFiles,
             selectedFolders,
-
             directFileBytes,
             selectedBytes,
-
             freeBytes,
             driveTotalBytes,
-
             driveLetter,
-
-            currentPath,
-            singleFileDetails
+            contentOverrideText,
+            selectionOverrideText,
+            singleFileDetails,
+            contentCache,
+            metadataCache
         );
 
-    shellFolder->Release();
     folderView->Release();
     shellView->Release();
-    browser->Release();
-
-    return changed;
+    return changes;
 }
 
 // ============================================================
 // Worker
 // ============================================================
+
+static bool WaitForWorkerStop(
+    DWORD timeoutMs
+)
+{
+    HANDLE handles[2] =
+    {
+        g_stopEvent,
+        g_workerWakeEvent
+    };
+
+    const DWORD result =
+        WaitForMultipleObjects(
+            ARRAYSIZE(handles),
+            handles,
+            FALSE,
+            timeoutMs
+        );
+
+    return result == WAIT_OBJECT_0;
+}
 
 static DWORD WINAPI WorkerThreadProc(
     LPVOID
@@ -1793,45 +2805,157 @@ static DWORD WINAPI WorkerThreadProc(
         );
 
     Wh_Log(
-        L"Explorer Info Bar worker start "
-        L"PID=%lu COM=0x%08X",
+        L"Explorer Info Bar worker start PID=%lu COM=0x%08X",
         g_pid,
-        static_cast<unsigned>(
-            comHr
-        )
+        static_cast<unsigned>(comHr)
     );
 
-    if (
-        WaitForSingleObject(
-            g_stopEvent,
-            kInitialRefreshDelayMs
-        ) == WAIT_OBJECT_0
-    )
+    if (FAILED(comHr))
     {
-        if (SUCCEEDED(comHr))
-            CoUninitialize();
-
+        Wh_Log(
+            L"Explorer Info Bar worker COM initialization failed "
+            L"PID=%lu HRESULT=0x%08X",
+            g_pid,
+            static_cast<unsigned>(comHr)
+        );
         return 0;
     }
 
+    const bool callCancellationEnabled =
+        SUCCEEDED(
+            CoEnableCallCancellation(nullptr)
+        );
+
+    IGlobalInterfaceTable* table = nullptr;
+    const HRESULT gitHr =
+        CreateGlobalInterfaceTable(&table);
+
+    if (FAILED(gitHr) || !table)
+    {
+        Wh_Log(
+            L"Global Interface Table initialization failed HRESULT=0x%08X",
+            static_cast<unsigned>(gitHr)
+        );
+
+        if (callCancellationEnabled)
+            CoDisableCallCancellation(nullptr);
+
+        CoUninitialize();
+        return 0;
+    }
+
+    if (
+        WaitForWorkerStop(
+            kInitialRefreshDelayMs
+        )
+    )
+    {
+        table->Release();
+
+        if (callCancellationEnabled)
+            CoDisableCallCancellation(nullptr);
+
+        CoUninitialize();
+        return 0;
+    }
+
+    struct WorkerTarget
+    {
+        HWND hwnd;
+        DWORD shellBrowserCookie;
+    };
+
     while (true)
     {
-        if (ReadCurrentView())
-            RefreshInfoBar();
+        std::vector<WorkerTarget> targets;
+
+        bool snapshotFailed = false;
+
+        AcquireSRWLockShared(&g_subclassLock);
+
+        try
+        {
+            targets.reserve(g_trackedWindows.size());
+
+            for (const TrackedDirectUiState& state : g_trackedWindows)
+            {
+                if (state.shellBrowserCookie)
+                {
+                    targets.push_back({
+                        state.hwnd,
+                        state.shellBrowserCookie
+                    });
+                }
+            }
+        }
+        catch (...)
+        {
+            snapshotFailed = true;
+        }
+
+        ReleaseSRWLockShared(&g_subclassLock);
+
+        if (snapshotFailed)
+        {
+            Wh_Log(L"Worker target snapshot failed");
+            targets.clear();
+        }
+
+        for (const WorkerTarget& target : targets)
+        {
+            if (
+                g_unloading.load(std::memory_order_acquire) ||
+                WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0
+            )
+            {
+                break;
+            }
+
+            IShellBrowser* browser = nullptr;
+
+            const HRESULT hr =
+                table->GetInterfaceFromGlobal(
+                    target.shellBrowserCookie,
+                    IID_IShellBrowser,
+                    reinterpret_cast<void**>(&browser)
+                );
+
+            if (FAILED(hr) || !browser)
+                continue;
+
+            const unsigned changes =
+                ReadCurrentView(
+                    target.hwnd,
+                    browser
+                );
+
+            browser->Release();
+
+            if (changes != CacheChangeNone)
+            {
+                RefreshInfoBarWindow(
+                    target.hwnd,
+                    changes
+                );
+            }
+        }
 
         if (
-            WaitForSingleObject(
-                g_stopEvent,
+            WaitForWorkerStop(
                 kRefreshIntervalMs
-            ) == WAIT_OBJECT_0
+            )
         )
         {
             break;
         }
     }
 
-    if (SUCCEEDED(comHr))
-        CoUninitialize();
+    table->Release();
+
+    if (callCancellationEnabled)
+        CoDisableCallCancellation(nullptr);
+
+    CoUninitialize();
 
     Wh_Log(
         L"Explorer Info Bar worker end PID=%lu",
@@ -1946,17 +3070,17 @@ static COLORREF PickBackgroundColor(
     int selected
 )
 {
-    // Keep the native unselected status-row background stable.
-    // Explorer can temporarily tint the row while items are selected,
-    // which should not redefine the mod's automatic theme colors.
+    // Keep the native unselected status-row background stable per window.
+    // Explorer can temporarily tint the row while items are selected.
+    const StableThemeSnapshot stable =
+        GetStableThemeStateSnapshot(hwnd);
 
     if (
         selected > 0 &&
-        hwnd == g_stableRowBackgroundHwnd &&
-        g_stableRowBackground != CLR_INVALID
+        stable.rowBackground != CLR_INVALID
     )
     {
-        return g_stableRowBackground;
+        return stable.rowBackground;
     }
 
     const int y =
@@ -1965,60 +3089,50 @@ static COLORREF PickBackgroundColor(
 
     const int samples[] =
     {
-        420,
-        520,
-        620,
-        720
+        ScaleForWindow(hwnd, 420),
+        ScaleForWindow(hwnd, 520),
+        ScaleForWindow(hwnd, 620),
+        ScaleForWindow(hwnd, 720)
     };
 
-    COLORREF chosen =
-        CLR_INVALID;
+    COLORREF chosen = CLR_INVALID;
 
     for (int x : samples)
     {
         if (x >= row.right)
             continue;
 
-        COLORREF c =
+        const COLORREF sample =
             GetPixel(
                 hdc,
                 x,
                 y
             );
 
-        if (c != CLR_INVALID)
+        if (sample != CLR_INVALID)
         {
-            chosen = c;
+            chosen = sample;
             break;
         }
     }
 
     if (chosen == CLR_INVALID)
     {
-        if (
-            hwnd == g_stableRowBackgroundHwnd &&
-            g_stableRowBackground != CLR_INVALID
-        )
-        {
-            return g_stableRowBackground;
-        }
+        if (stable.rowBackground != CLR_INVALID)
+            return stable.rowBackground;
 
-        chosen =
-            RGB(
-                32,
-                32,
-                32
-            );
+        chosen = RGB(32, 32, 32);
     }
 
-    // Only learn/update the "normal" row background while unselected.
     if (selected <= 0)
     {
-        g_stableRowBackgroundHwnd =
-            hwnd;
-
-        g_stableRowBackground =
-            chosen;
+        UpdateStableThemeState(
+            hwnd,
+            chosen,
+            true,
+            CLR_INVALID,
+            false
+        );
     }
 
     return chosen;
@@ -2035,6 +3149,12 @@ static void DrawFinalPiece(
     if (text.empty())
         return;
 
+    if (x >= row.right)
+    {
+        x = row.right;
+        return;
+    }
+
     int width =
         MeasureTextWidth(
             hdc,
@@ -2048,7 +3168,12 @@ static void DrawFinalPiece(
         x;
 
     rc.right =
-        x + width + 4;
+        std::min(
+            x + width + 4,
+            static_cast<int>(
+                row.right
+            )
+        );
 
     SetTextColor(
         hdc,
@@ -2155,19 +3280,19 @@ static COLORREF PickNativeTextColor(
     int selected
 )
 {
+    const StableThemeSnapshot stable =
+        GetStableThemeStateSnapshot(hwnd);
+
     if (
         selected > 0 &&
-        hwnd == g_stableRowBackgroundHwnd &&
-        g_stableNativeTextColor != CLR_INVALID
+        stable.nativeTextColor != CLR_INVALID
     )
     {
-        return g_stableNativeTextColor;
+        return stable.nativeTextColor;
     }
 
     COLORREF candidate =
-        GetTextColor(
-            hdc
-        );
+        GetTextColor(hdc);
 
     if (
         candidate == CLR_INVALID ||
@@ -2183,13 +3308,15 @@ static COLORREF PickNativeTextColor(
             );
     }
 
-    if (
-        selected <= 0 &&
-        hwnd == g_stableRowBackgroundHwnd
-    )
+    if (selected <= 0)
     {
-        g_stableNativeTextColor =
-            candidate;
+        UpdateStableThemeState(
+            hwnd,
+            CLR_INVALID,
+            false,
+            candidate,
+            true
+        );
     }
 
     return candidate;
@@ -2207,7 +3334,8 @@ static COLORREF ResolveColor(
 
 static void PaintFinalInfoBar(
     HDC hdc,
-    HWND hwnd
+    HWND hwnd,
+    const RECT* updateRect = nullptr
 )
 {
     if (!hdc || !hwnd)
@@ -2229,24 +3357,25 @@ static void PaintFinalInfoBar(
     if (
         row.bottom <= row.top ||
         row.top < 0 ||
-        row.bottom > client.bottom + 2
+        row.bottom >
+            client.bottom + ScaleForWindow(hwnd, 2)
     )
     {
         row.top =
-            client.bottom > kStatusRowHeight
-                ? client.bottom - kStatusRowHeight
+            client.bottom > ScaleForWindow(hwnd, kStatusRowHeight)
+                ? client.bottom - ScaleForWindow(hwnd, kStatusRowHeight)
                 : 0;
 
         row.bottom =
             client.bottom;
     }
 
-    row.left = 6;
+    row.left = ScaleForWindow(hwnd, 6);
 
     // Preserve Explorer's right-side controls.
     row.right =
-        client.right > 220
-            ? client.right - 220
+        client.right > ScaleForWindow(hwnd, 220)
+            ? client.right - ScaleForWindow(hwnd, 220)
             : client.right;
 
     std::wstring contentGroup;
@@ -2257,6 +3386,7 @@ static void PaintFinalInfoBar(
     int selected = 0;
 
     GetCachedGroups(
+        hwnd,
         contentGroup,
         selectionGroup,
         driveGroup,
@@ -2266,6 +3396,58 @@ static void PaintFinalInfoBar(
 
     const ModSettings settings =
         GetSettingsSnapshot();
+
+    const bool showFileDetails =
+        settings.singleFileDetails &&
+        !fileDetailsGroup.empty();
+
+    const bool hasVisibleContent =
+        (
+            settings.showDrive &&
+            !driveGroup.empty()
+        ) ||
+        (
+            settings.showContent &&
+            !contentGroup.empty()
+        ) ||
+        (
+            settings.showSelection &&
+            !selectionGroup.empty()
+        ) ||
+        showFileDetails;
+
+    // Leave Explorer's native status row untouched when nothing custom is visible.
+    if (!hasVisibleContent)
+        return;
+
+    RECT paintRect =
+        row;
+
+    if (
+        updateRect &&
+        !IntersectRect(
+            &paintRect,
+            &paintRect,
+            updateRect
+        )
+    )
+    {
+        return;
+    }
+
+    const int savedDc =
+        SaveDC(hdc);
+
+    if (!savedDc)
+        return;
+
+    IntersectClipRect(
+        hdc,
+        paintRect.left,
+        paintRect.top,
+        paintRect.right,
+        paintRect.bottom
+    );
 
     COLORREF background =
         PickBackgroundColor(
@@ -2307,7 +3489,7 @@ static void PaintFinalInfoBar(
     // Match Explorer's native info-bar font metrics.
     HFONT font =
         CreateFontW(
-            -12,
+            -ScaleForWindow(hwnd, 12),
             0,
             0,
             0,
@@ -2425,35 +3607,21 @@ static void PaintFinalInfoBar(
             return settings.showSelection;
         };
 
-    const bool showFileDetails =
-        settings.singleFileDetails &&
-        !fileDetailsGroup.empty();
-
-    const bool hasVisibleContent =
-        (
-            settings.showDrive &&
-            !driveGroup.empty()
-        ) ||
-        (
-            settings.showContent &&
-            !contentGroup.empty()
-        ) ||
-        (
-            settings.showSelection &&
-            !selectionGroup.empty()
-        ) ||
-        showFileDetails;
-
-    // If every custom section is disabled or empty, leave Explorer's
-    // native status bar untouched instead of painting an empty row.
-    if (!hasVisibleContent)
-        return;
-
     int x =
-        14;
+        ScaleForWindow(hwnd, 14);
 
     bool drew =
         false;
+
+    InfoBarLayoutGeometry geometry;
+    geometry.hwnd = hwnd;
+    geometry.usableRight = row.right;
+    geometry.style = settings.style;
+    geometry.sectionOrder = settings.sectionOrder;
+    geometry.showDrive = settings.showDrive;
+    geometry.showContent = settings.showContent;
+    geometry.showSelection = settings.showSelection;
+    geometry.singleFileDetails = settings.singleFileDetails;
 
     if (settings.style == InfoBarStyle::Simple)
     {
@@ -2461,6 +3629,10 @@ static void PaintFinalInfoBar(
         {
             if (!IsSectionEnabled(section))
                 continue;
+
+            geometry.sectionLeft[
+                GetSectionGeometryIndex(section)
+            ] = x;
 
             const std::wstring& value =
                 GetSectionText(
@@ -2492,6 +3664,9 @@ static void PaintFinalInfoBar(
                 true;
         }
 
+        geometry.fileDetailsLeft =
+            x;
+
         if (showFileDetails)
         {
             if (drew)
@@ -2519,15 +3694,17 @@ static void PaintFinalInfoBar(
             settings.style == InfoBarStyle::Cards;
 
         const int padX =
-            cards ? 10 : 12;
+            ScaleForWindow(hwnd, cards ? 10 : 12);
 
         const int gap =
-            cards ? 8 : 6;
+            ScaleForWindow(hwnd, cards ? 8 : 6);
 
         // Flat panes should begin flush with the left edge.
         // Cards keep a tiny 2 px inset so the rounded border isn't clipped.
         int paneX =
-            cards ? 2 : 0;
+            cards
+                ? row.left + ScaleForWindow(hwnd, 2)
+                : 0;
 
         auto DrawBox =
             [&](const std::wstring& value,
@@ -2547,9 +3724,9 @@ static void PaintFinalInfoBar(
 
             RECT box{
                 paneX,
-                row.top + (cards ? 3 : 1),
+                row.top + ScaleForWindow(hwnd, cards ? 3 : 1),
                 paneX + width,
-                row.bottom - (cards ? 3 : 1)
+                row.bottom - ScaleForWindow(hwnd, cards ? 3 : 1)
             };
 
             if (box.right > row.right)
@@ -2585,8 +3762,8 @@ static void PaintFinalInfoBar(
                         box.top,
                         box.right,
                         box.bottom,
-                        6,
-                        6
+                        ScaleForWindow(hwnd, 6),
+                        ScaleForWindow(hwnd, 6)
                     );
 
                     SelectObject(hdc, oldPen);
@@ -2648,6 +3825,10 @@ static void PaintFinalInfoBar(
             if (!IsSectionEnabled(section))
                 continue;
 
+            geometry.sectionLeft[
+                GetSectionGeometryIndex(section)
+            ] = paneX;
+
             const std::wstring& value =
                 GetSectionText(
                     section
@@ -2672,6 +3853,9 @@ static void PaintFinalInfoBar(
             );
         }
 
+        geometry.fileDetailsLeft =
+            paneX;
+
         if (showFileDetails)
         {
             DrawBox(
@@ -2682,6 +3866,10 @@ static void PaintFinalInfoBar(
             );
         }
     }
+
+    StoreLayoutGeometry(
+        geometry
+    );
 
     if (oldFont)
     {
@@ -2707,15 +3895,34 @@ static void PaintFinalInfoBar(
         hdc,
         oldBkMode
     );
+
+    RestoreDC(
+        hdc,
+        savedDc
+    );
 }
 
 
-static bool EnsureDirectUiSubclass(
+enum class DirectUiSubclassResult
+{
+    Failed,
+    AlreadyInstalled,
+    NewlyInstalled
+};
+
+static DirectUiSubclassResult EnsureDirectUiSubclass(
     HWND hwnd
 )
 {
-    if (!hwnd)
-        return false;
+    if (
+        !hwnd ||
+        g_unloading.load(
+            std::memory_order_acquire
+        )
+    )
+    {
+        return DirectUiSubclassResult::Failed;
+    }
 
     DWORD hwndThread =
         GetWindowThreadProcessId(
@@ -2735,19 +3942,42 @@ static bool EnsureDirectUiSubclass(
             GetCurrentThreadId()
         );
 
-        return false;
+        return DirectUiSubclassResult::Failed;
     }
 
+    AcquireSRWLockExclusive(
+        &g_subclassLock
+    );
+
     if (
-        GetWindowSubclass(
-            hwnd,
-            DirectUiSubclassProc,
-            kDirectUiSubclassId,
-            nullptr
+        g_unloading.load(
+            std::memory_order_acquire
         )
     )
     {
-        return true;
+        ReleaseSRWLockExclusive(
+            &g_subclassLock
+        );
+
+        return DirectUiSubclassResult::Failed;
+    }
+
+    if (
+        std::find_if(
+            g_trackedWindows.begin(),
+            g_trackedWindows.end(),
+            [&](const TrackedDirectUiState& value)
+            {
+                return value.hwnd == hwnd;
+            }
+        ) != g_trackedWindows.end()
+    )
+    {
+        ReleaseSRWLockExclusive(
+            &g_subclassLock
+        );
+
+        return DirectUiSubclassResult::AlreadyInstalled;
     }
 
     if (
@@ -2759,22 +3989,73 @@ static bool EnsureDirectUiSubclass(
         )
     )
     {
+        ReleaseSRWLockExclusive(
+            &g_subclassLock
+        );
+
         Wh_Log(
             L"SetWindowSubclass failed hwnd=%p error=%lu",
             hwnd,
             GetLastError()
         );
 
-        return false;
+        return DirectUiSubclassResult::Failed;
     }
 
-    Wh_Log(
-        L"DirectUI subclass installed hwnd=%p tid=%lu",
-        hwnd,
-        GetCurrentThreadId()
+    try
+    {
+        TrackedDirectUiState state;
+        state.hwnd = hwnd;
+        g_trackedWindows.push_back(
+            std::move(state)
+        );
+    }
+    catch (...)
+    {
+        RemoveWindowSubclass(
+            hwnd,
+            DirectUiSubclassProc,
+            kDirectUiSubclassId
+        );
+
+        ReleaseSRWLockExclusive(
+            &g_subclassLock
+        );
+
+        Wh_Log(
+            L"DirectUI subclass tracking failed hwnd=%p",
+            hwnd
+        );
+
+        return DirectUiSubclassResult::Failed;
+    }
+
+    ReleaseSRWLockExclusive(
+        &g_subclassLock
     );
 
-    return true;
+    EnsureWindowDataCache(hwnd);
+    EnsureShellBrowserRegistration(hwnd);
+
+    // Run the follow-up invalidation after the native paint that installed us.
+    if (
+        g_refreshDirectUiMessage &&
+        !PostMessageW(
+            hwnd,
+            g_refreshDirectUiMessage,
+            0,
+            0
+        )
+    )
+    {
+        Wh_Log(
+            L"DirectUI initial refresh post failed hwnd=%p error=%lu",
+            hwnd,
+            GetLastError()
+        );
+    }
+
+    return DirectUiSubclassResult::NewlyInstalled;
 }
 
 static LRESULT CALLBACK DirectUiSubclassProc(
@@ -2782,10 +4063,72 @@ static LRESULT CALLBACK DirectUiSubclassProc(
     UINT msg,
     WPARAM wParam,
     LPARAM lParam,
-    UINT_PTR subclassId,
-    DWORD_PTR refData
+    UINT_PTR,
+    DWORD_PTR
 )
 {
+    if (
+        g_refreshDirectUiMessage &&
+        msg == g_refreshDirectUiMessage
+    )
+    {
+        if (!g_unloading.load(std::memory_order_acquire))
+            InvalidateInfoBarWindow(hwnd);
+
+        return 0;
+    }
+
+    if (
+        g_removeDirectUiSubclassMessage &&
+        msg == g_removeDirectUiSubclassMessage
+    )
+    {
+        const DWORD ownerThread =
+            GetWindowThreadProcessId(
+                hwnd,
+                nullptr
+            );
+
+        const BOOL removed =
+            ownerThread == GetCurrentThreadId() &&
+            RemoveWindowSubclass(
+                hwnd,
+                DirectUiSubclassProc,
+                kDirectUiSubclassId
+            );
+
+        if (removed)
+        {
+            const DWORD shellBrowserCookie =
+                GetShellBrowserCookieSnapshot(hwnd);
+
+            EraseWindowDataCache(hwnd);
+            RevokeShellBrowserCookie(shellBrowserCookie);
+
+            RECT row{};
+
+            if (GetBottomStatusRowRect(hwnd, &row))
+            {
+                RedrawWindow(
+                    hwnd,
+                    &row,
+                    nullptr,
+                    RDW_INVALIDATE |
+                    RDW_ERASE
+                );
+            }
+
+            // Untrack last. If the synchronous removal request times out,
+            // teardown keeps treating this HWND as live until all callback
+            // cleanup has finished.
+            AcquireSRWLockExclusive(&g_subclassLock);
+            UntrackDirectUiWindowLocked(hwnd);
+            ReleaseSRWLockExclusive(&g_subclassLock);
+        }
+
+        return removed ? 1 : 0;
+    }
+
     if (msg == WM_NCDESTROY)
     {
         RemoveWindowSubclass(
@@ -2794,25 +4137,30 @@ static LRESULT CALLBACK DirectUiSubclassProc(
             kDirectUiSubclassId
         );
 
-        if (
-            g_lastDirectUiHwnd.load(
-                std::memory_order_relaxed
-            ) == hwnd
+        const DWORD shellBrowserCookie =
+            GetShellBrowserCookieSnapshot(hwnd);
+
+        EraseWindowDataCache(hwnd);
+        RevokeShellBrowserCookie(shellBrowserCookie);
+
+        AcquireSRWLockExclusive(&g_subclassLock);
+        UntrackDirectUiWindowLocked(hwnd);
+        ReleaseSRWLockExclusive(&g_subclassLock);
+
+        return DefSubclassProc(
+            hwnd,
+            msg,
+            wParam,
+            lParam
+        );
+    }
+
+    if (
+        g_unloading.load(
+            std::memory_order_acquire
         )
-        {
-            g_lastDirectUiHwnd.store(
-                nullptr,
-                std::memory_order_relaxed
-            );
-        }
-
-        if (g_stableRowBackgroundHwnd == hwnd)
-        {
-            g_stableRowBackgroundHwnd = nullptr;
-            g_stableRowBackground = CLR_INVALID;
-            g_stableNativeTextColor = CLR_INVALID;
-        }
-
+    )
+    {
         return DefSubclassProc(
             hwnd,
             msg,
@@ -2823,6 +4171,18 @@ static LRESULT CALLBACK DirectUiSubclassProc(
 
     if (msg == WM_PAINT)
     {
+        EnsureWindowDataCache(hwnd);
+        EnsureShellBrowserRegistration(hwnd);
+
+        RECT updateRect{};
+
+        const BOOL hasUpdateRect =
+            GetUpdateRect(
+                hwnd,
+                &updateRect,
+                FALSE
+            );
+
         // Let DirectUI finish ALL of its own buffered painting first.
         LRESULT result =
             DefSubclassProc(
@@ -2842,7 +4202,10 @@ static LRESULT CALLBACK DirectUiSubclassProc(
 
             PaintFinalInfoBar(
                 hdc,
-                hwnd
+                hwnd,
+                hasUpdateRect
+                    ? &updateRect
+                    : nullptr
             );
 
             g_insideFinalPaint =
@@ -2974,14 +4337,18 @@ static BOOL WINAPI BitBlt_Hook(
     if (!IsDirectUiWindow(hwnd))
         return result;
 
-    g_lastDirectUiHwnd.store(
-        hwnd,
-        std::memory_order_relaxed
-    );
+    if (
+        g_unloading.load(
+            std::memory_order_acquire
+        )
+    )
+    {
+        return result;
+    }
 
     // This hook runs on DirectUI's UI thread, which is required for subclassing.
     // Install the subclass here so every future WM_PAINT ends with our row.
-    const bool subclassed =
+    const DirectUiSubclassResult subclassResult =
         EnsureDirectUiSubclass(
             hwnd
         );
@@ -2989,7 +4356,10 @@ static BOOL WINAPI BitBlt_Hook(
     // The subclass cannot retroactively catch the WM_PAINT that is already
     // in progress when it is first installed, so finish this current frame
     // once directly after the relevant BitBlt.
-    if (subclassed)
+    if (
+        subclassResult ==
+        DirectUiSubclassResult::NewlyInstalled
+    )
     {
         g_insideFinalPaint =
             true;
@@ -3011,19 +4381,154 @@ static BOOL WINAPI BitBlt_Hook(
 // Windhawk lifecycle
 // ============================================================
 
+struct ActivateExistingExplorerContext
+{
+    DWORD pid;
+};
+
+static BOOL CALLBACK ActivateDirectUiChildProc(
+    HWND hwnd,
+    LPARAM lParam
+)
+{
+    auto* context =
+        reinterpret_cast<ActivateExistingExplorerContext*>(
+            lParam
+        );
+
+    if (
+        g_unloading.load(std::memory_order_acquire) ||
+        !IsWindowVisible(hwnd)
+    )
+    {
+        return TRUE;
+    }
+
+    DWORD pid = 0;
+
+    GetWindowThreadProcessId(
+        hwnd,
+        &pid
+    );
+
+    if (pid != context->pid)
+        return TRUE;
+
+    wchar_t className[128] = {};
+
+    if (
+        GetClassNameW(
+            hwnd,
+            className,
+            ARRAYSIZE(className)
+        ) &&
+        wcscmp(className, L"DirectUIHWND") == 0
+    )
+    {
+        // The resulting native paint reaches BitBlt_Hook on this window's UI
+        // thread, where the existing correlation safely selects the target.
+        InvalidateInfoBarWindow(hwnd);
+    }
+
+    return TRUE;
+}
+
+static BOOL CALLBACK ActivateExistingExplorerProc(
+    HWND hwnd,
+    LPARAM lParam
+)
+{
+    auto* context =
+        reinterpret_cast<ActivateExistingExplorerContext*>(
+            lParam
+        );
+
+    if (g_unloading.load(std::memory_order_acquire))
+        return FALSE;
+
+    DWORD pid = 0;
+
+    GetWindowThreadProcessId(
+        hwnd,
+        &pid
+    );
+
+    if (
+        pid != context->pid ||
+        !IsWindowVisible(hwnd)
+    )
+    {
+        return TRUE;
+    }
+
+    wchar_t className[128] = {};
+
+    if (
+        !GetClassNameW(
+            hwnd,
+            className,
+            ARRAYSIZE(className)
+        ) ||
+        wcscmp(className, L"CabinetWClass") != 0
+    )
+    {
+        return TRUE;
+    }
+
+    EnumChildWindows(
+        hwnd,
+        ActivateDirectUiChildProc,
+        lParam
+    );
+
+    return TRUE;
+}
+
 BOOL Wh_ModInit()
 {
+    g_unloading.store(
+        false,
+        std::memory_order_release
+    );
+
     g_pid =
         GetCurrentProcessId();
 
     Wh_Log(
-        L"========== Explorer Info Bar 0.49 INIT PID=%lu ==========",
+        L"========== Explorer Info Bar INIT PID=%lu ==========",
         g_pid
     );
 
     InitializeCriticalSection(
         &g_cacheLock
     );
+
+    g_removeDirectUiSubclassMessage =
+        RegisterWindowMessageW(
+            L"Windhawk_ExplorerInfoBar_RemoveDirectUiSubclass"
+        );
+
+    g_refreshDirectUiMessage =
+        RegisterWindowMessageW(
+            L"Windhawk_ExplorerInfoBar_RefreshDirectUi"
+        );
+
+    if (
+        !g_removeDirectUiSubclassMessage ||
+        !g_refreshDirectUiMessage
+    )
+    {
+        Wh_Log(
+            L"DirectUI message registration failed error=%lu",
+            GetLastError()
+        );
+
+        DeleteCriticalSection(
+            &g_cacheLock
+        );
+
+        return FALSE;
+    }
 
     LoadSettings();
 
@@ -3147,6 +4652,27 @@ BOOL Wh_ModInit()
         return FALSE;
     }
 
+    g_workerWakeEvent =
+        CreateEventW(
+            nullptr,
+            FALSE,
+            FALSE,
+            nullptr
+        );
+
+    if (!g_workerWakeEvent)
+    {
+        Wh_Log(
+            L"worker wake event creation failed error=%lu",
+            GetLastError()
+        );
+
+        CloseHandle(g_stopEvent);
+        g_stopEvent = nullptr;
+        DeleteCriticalSection(&g_cacheLock);
+        return FALSE;
+    }
+
     g_workerThread =
         CreateThread(
             nullptr,
@@ -3154,7 +4680,7 @@ BOOL Wh_ModInit()
             WorkerThreadProc,
             nullptr,
             0,
-            nullptr
+            &g_workerThreadId
         );
 
     if (!g_workerThread)
@@ -3171,6 +4697,10 @@ BOOL Wh_ModInit()
         g_stopEvent =
             nullptr;
 
+        CloseHandle(g_workerWakeEvent);
+        g_workerWakeEvent = nullptr;
+        g_workerThreadId = 0;
+
         DeleteCriticalSection(
             &g_cacheLock
         );
@@ -3179,17 +4709,184 @@ BOOL Wh_ModInit()
     }
 
     Wh_Log(
-        L"Explorer Info Bar 0.49 ready"
+        L"Explorer Info Bar ready"
     );
 
     return TRUE;
 }
 
 
+void Wh_ModAfterInit()
+{
+    ActivateExistingExplorerContext context{
+        g_pid
+    };
+
+    EnumWindows(
+        ActivateExistingExplorerProc,
+        reinterpret_cast<LPARAM>(
+            &context
+        )
+    );
+
+}
+
+
 void Wh_ModSettingsChanged()
 {
     LoadSettings();
-    RefreshInfoBar();
+
+    if (g_workerWakeEvent)
+        SetEvent(g_workerWakeEvent);
+
+    RefreshInfoBars();
+}
+
+void Wh_ModBeforeUninit()
+{
+    g_unloading.store(
+        true,
+        std::memory_order_release
+    );
+
+    if (g_stopEvent)
+        SetEvent(g_stopEvent);
+
+    if (g_workerThreadId)
+        CoCancelCall(g_workerThreadId, 0);
+
+    // A subclass callback points into this module, so unload must not proceed
+    // until every subclass is removed and any timed-out removal callback has
+    // returned to its owning UI thread.
+    ULONGLONG lastWaitLogTick = 0;
+
+    while (true)
+    {
+        HWND hwnd = nullptr;
+
+        AcquireSRWLockShared(&g_subclassLock);
+
+        if (!g_trackedWindows.empty())
+            hwnd = g_trackedWindows.front().hwnd;
+
+        ReleaseSRWLockShared(&g_subclassLock);
+
+        if (!hwnd)
+            break;
+
+        while (true)
+        {
+            const DWORD ownerThread =
+                GetWindowThreadProcessId(
+                    hwnd,
+                    nullptr
+                );
+
+            if (!ownerThread || !IsWindow(hwnd))
+            {
+                AcquireSRWLockExclusive(&g_subclassLock);
+                const DWORD shellBrowserCookie =
+                    UntrackDirectUiWindowLocked(hwnd);
+                ReleaseSRWLockExclusive(&g_subclassLock);
+
+                EraseWindowDataCache(hwnd);
+                RevokeShellBrowserCookie(shellBrowserCookie);
+                break;
+            }
+
+            DWORD_PTR removalResult = 0;
+            SetLastError(ERROR_SUCCESS);
+
+            const LRESULT sent =
+                SendMessageTimeoutW(
+                    hwnd,
+                    g_removeDirectUiSubclassMessage,
+                    0,
+                    0,
+                    SMTO_ABORTIFHUNG |
+                    SMTO_BLOCK |
+                    SMTO_ERRORONEXIT,
+                    kSubclassRemovalTimeoutMs,
+                    &removalResult
+                );
+
+            if (sent && removalResult == 1)
+            {
+                // SendMessageTimeout returned only after the owner-thread
+                // callback returned, so this HWND is safe to forget.
+                break;
+            }
+
+            bool stillTracked = false;
+
+            AcquireSRWLockShared(&g_subclassLock);
+
+            stillTracked =
+                std::find_if(
+                    g_trackedWindows.begin(),
+                    g_trackedWindows.end(),
+                    [&](const TrackedDirectUiState& value)
+                    {
+                        return value.hwnd == hwnd;
+                    }
+                ) != g_trackedWindows.end();
+
+            ReleaseSRWLockShared(&g_subclassLock);
+
+            if (!stillTracked)
+            {
+                // The removal callback can finish after SendMessageTimeout
+                // gives up. A synchronous no-op message is a UI-thread
+                // barrier: once it returns, that earlier callback has returned.
+                while (IsWindow(hwnd))
+                {
+                    DWORD_PTR barrierResult = 0;
+
+                    const LRESULT barrierSent =
+                        SendMessageTimeoutW(
+                            hwnd,
+                            WM_NULL,
+                            0,
+                            0,
+                            SMTO_ABORTIFHUNG |
+                            SMTO_BLOCK |
+                            SMTO_ERRORONEXIT,
+                            kSubclassRemovalTimeoutMs,
+                            &barrierResult
+                        );
+
+                    if (barrierSent)
+                        break;
+
+                    Sleep(25);
+                }
+
+                break;
+            }
+
+            const ULONGLONG now = GetTickCount64();
+
+            if (
+                lastWaitLogTick == 0 ||
+                now - lastWaitLogTick >= 2000
+            )
+            {
+                Wh_Log(
+                    L"Waiting for DirectUI subclass removal hwnd=%p "
+                    L"ownerTid=%lu error=%lu",
+                    hwnd,
+                    ownerThread,
+                    GetLastError()
+                );
+
+                lastWaitLogTick = now;
+            }
+
+            Sleep(25);
+        }
+    }
+
+    Wh_Log(L"Explorer Info Bar subclass teardown complete");
 }
 
 void Wh_ModUninit()
@@ -3200,6 +4897,9 @@ void Wh_ModUninit()
             g_stopEvent
         );
     }
+
+    if (g_workerThreadId)
+        CoCancelCall(g_workerThreadId, 0);
 
     if (g_workerThread)
     {
@@ -3216,6 +4916,8 @@ void Wh_ModUninit()
 
         g_workerThread =
             nullptr;
+
+        g_workerThreadId = 0;
     }
 
     if (g_stopEvent)
@@ -3228,12 +4930,18 @@ void Wh_ModUninit()
             nullptr;
     }
 
+    if (g_workerWakeEvent)
+    {
+        CloseHandle(g_workerWakeEvent);
+        g_workerWakeEvent = nullptr;
+    }
+
     DeleteCriticalSection(
         &g_cacheLock
     );
 
     Wh_Log(
-        L"========== Explorer Info Bar 0.49 UNINIT PID=%lu ==========",
+        L"========== Explorer Info Bar UNINIT PID=%lu ==========",
         g_pid
     );
 }
