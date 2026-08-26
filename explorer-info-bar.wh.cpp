@@ -19,6 +19,8 @@ A customizable Windhawk mod that enhances the bottom info bar in Windows 11 File
 
 Explorer Info Bar adds useful drive, folder, selection, and single-file information while keeping the native Explorer look and adapting to light, dark, and customized themes.
 
+![Explorer Info Bar preview](https://raw.githubusercontent.com/digart11/explorer-info-bar/main/images/explorer-info-bar-preview.png)
+
 ## Features
 
 - Drive free-space information
@@ -49,18 +51,22 @@ Explorer Info Bar adds useful drive, folder, selection, and single-file informat
 
 Typical information shown by the mod:
 
+```text
 Drive D: 150.7GB free
 Content: 15 folders / 25 files (77.2MB)
 Selected: 2 folders / 4 files (571KB)
+```
 
 When one file is selected, additional details can appear:
 
-.jpg (4032&times;3024)
-.jpeg (6000&times;4000)
-.mp4 (1920&times;1080, 01:23:43)
+```text
+.jpg (4032×3024)
+.jpeg (6000×4000)
+.mp4 (1920×1080, 01:23:43)
 .mp3 (00:03:47)
 .doc
 .pdf
+```
 */
 // ==/WindhawkModReadme==
 
