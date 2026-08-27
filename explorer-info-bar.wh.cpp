@@ -311,6 +311,9 @@ static HANDLE g_workerThread = nullptr;
 static DWORD g_workerThreadId = 0;
 static HANDLE g_stopEvent = nullptr;
 static HANDLE g_workerWakeEvent = nullptr;
+static HANDLE g_selectionWinEventThread = nullptr;
+static HANDLE g_selectionWinEventThreadReady = nullptr;
+static HANDLE g_selectionWinEventStopEvent = nullptr;
 static HWINEVENTHOOK g_selectionWinEventHook = nullptr;
 static std::atomic<ULONGLONG> g_selectionGeneration{1};
 static std::atomic<ULONGLONG> g_lastPaintWakeTick{0};
@@ -1974,6 +1977,102 @@ static void CALLBACK SelectionWinEventProc(
         SetEvent(g_workerWakeEvent);
 }
 
+static DWORD WINAPI SelectionWinEventThreadProc(
+    LPVOID
+)
+{
+    // WINEVENT_OUTOFCONTEXT callbacks are delivered on the thread that
+    // installed the hook, so this thread owns the hook and its message pump.
+    MSG msg{};
+    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+
+    g_selectionWinEventHook =
+        SetWinEventHook(
+            EVENT_OBJECT_SELECTION,
+            EVENT_OBJECT_SELECTIONWITHIN,
+            nullptr,
+            SelectionWinEventProc,
+            g_pid,
+            0,
+            WINEVENT_OUTOFCONTEXT
+        );
+
+    if (!g_selectionWinEventHook)
+    {
+        Wh_Log(
+            L"selection WinEvent hook failed error=%lu",
+            GetLastError()
+        );
+    }
+
+    SetEvent(g_selectionWinEventThreadReady);
+
+    if (!g_selectionWinEventHook)
+        return 1;
+
+    bool quit = false;
+
+    while (!quit)
+    {
+        const DWORD waitResult =
+            MsgWaitForMultipleObjectsEx(
+                1,
+                &g_selectionWinEventStopEvent,
+                INFINITE,
+                QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE
+            );
+
+        if (waitResult == WAIT_OBJECT_0)
+        {
+            break;
+        }
+        else if (waitResult == WAIT_OBJECT_0 + 1)
+        {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
+            {
+                if (msg.message == WM_QUIT)
+                {
+                    quit = true;
+                    break;
+                }
+
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        else
+        {
+            Wh_Log(
+                L"selection WinEvent message wait failed result=%lu error=%lu",
+                waitResult,
+                GetLastError()
+            );
+
+            break;
+        }
+    }
+
+    // The hook is installed, pumped and removed by this same owning thread.
+    UnhookWinEvent(g_selectionWinEventHook);
+    g_selectionWinEventHook = nullptr;
+
+    return 0;
+}
+
+static void StopSelectionWinEventThread()
+{
+    if (g_selectionWinEventThread)
+    {
+        if (g_selectionWinEventStopEvent)
+            SetEvent(g_selectionWinEventStopEvent);
+
+        WaitForSingleObject(g_selectionWinEventThread, INFINITE);
+        CloseHandle(g_selectionWinEventThread);
+        g_selectionWinEventThread = nullptr;
+    }
+}
+
 static bool EnsureWindowDataCache(
     HWND hwnd
 )
@@ -2713,10 +2812,22 @@ static unsigned ReadCurrentView(
             const bool folderChanged =
                 contentCache.folderIdentity != state.contentRefresh.folderIdentity;
 
+            // A one-item selection needs an identity-sensitive fallback:
+            // arrowing to another item keeps the count at one. Re-enumerate
+            // that single item on the existing worker refresh cadence so a
+            // missed/failed WinEvent cannot leave size or metadata stale.
+            const bool singleSelectionFallback =
+                selectionCount == 1 &&
+                (
+                    settings.showSelection ||
+                    settings.singleFileDetails
+                );
+
             const bool selectionDirty =
                 selectionGeneration != state.selectionGeneration ||
                 selected != state.selected ||
-                folderChanged;
+                folderChanged ||
+                singleSelectionFallback;
 
             const bool enumerateSelection =
                 selectionDirty &&
@@ -4776,23 +4887,76 @@ BOOL Wh_ModInit()
         return FALSE;
     }
 
-    g_selectionWinEventHook =
-        SetWinEventHook(
-            EVENT_OBJECT_SELECTION,
-            EVENT_OBJECT_SELECTIONWITHIN,
+    g_selectionWinEventThreadReady =
+        CreateEventW(
             nullptr,
-            SelectionWinEventProc,
-            g_pid,
-            0,
-            WINEVENT_OUTOFCONTEXT
+            TRUE,
+            FALSE,
+            nullptr
         );
 
-    if (!g_selectionWinEventHook)
+    g_selectionWinEventStopEvent =
+        CreateEventW(
+            nullptr,
+            TRUE,
+            FALSE,
+            nullptr
+        );
+
+    if (
+        !g_selectionWinEventThreadReady ||
+        !g_selectionWinEventStopEvent
+    )
     {
         Wh_Log(
-            L"selection WinEvent hook failed error=%lu",
+            L"selection WinEvent helper event creation failed error=%lu",
             GetLastError()
         );
+
+        if (g_selectionWinEventThreadReady)
+        {
+            CloseHandle(g_selectionWinEventThreadReady);
+            g_selectionWinEventThreadReady = nullptr;
+        }
+
+        if (g_selectionWinEventStopEvent)
+        {
+            CloseHandle(g_selectionWinEventStopEvent);
+            g_selectionWinEventStopEvent = nullptr;
+        }
+    }
+    else
+    {
+        g_selectionWinEventThread =
+            CreateThread(
+                nullptr,
+                0,
+                SelectionWinEventThreadProc,
+                nullptr,
+                0,
+                nullptr
+            );
+
+        if (!g_selectionWinEventThread)
+        {
+            Wh_Log(
+                L"selection WinEvent helper creation failed error=%lu",
+                GetLastError()
+            );
+
+            CloseHandle(g_selectionWinEventThreadReady);
+            g_selectionWinEventThreadReady = nullptr;
+            CloseHandle(g_selectionWinEventStopEvent);
+            g_selectionWinEventStopEvent = nullptr;
+        }
+        else
+        {
+            // The helper signals only after queue creation and its hook
+            // installation attempt, closing the startup/shutdown race.
+            WaitForSingleObject(g_selectionWinEventThreadReady, INFINITE);
+            CloseHandle(g_selectionWinEventThreadReady);
+            g_selectionWinEventThreadReady = nullptr;
+        }
     }
 
     g_workerThread =
@@ -4807,10 +4971,12 @@ BOOL Wh_ModInit()
 
     if (!g_workerThread)
     {
-        if (g_selectionWinEventHook)
+        StopSelectionWinEventThread();
+
+        if (g_selectionWinEventStopEvent)
         {
-            UnhookWinEvent(g_selectionWinEventHook);
-            g_selectionWinEventHook = nullptr;
+            CloseHandle(g_selectionWinEventStopEvent);
+            g_selectionWinEventStopEvent = nullptr;
         }
 
         Wh_Log(
@@ -4883,12 +5049,6 @@ void Wh_ModBeforeUninit()
 
     if (g_stopEvent)
         SetEvent(g_stopEvent);
-
-    if (g_selectionWinEventHook)
-    {
-        UnhookWinEvent(g_selectionWinEventHook);
-        g_selectionWinEventHook = nullptr;
-    }
 
     if (g_workerThreadId)
         CoCancelCall(g_workerThreadId, 0);
@@ -4964,6 +5124,14 @@ void Wh_ModUninit()
         SetEvent(
             g_stopEvent
         );
+    }
+
+    StopSelectionWinEventThread();
+
+    if (g_selectionWinEventStopEvent)
+    {
+        CloseHandle(g_selectionWinEventStopEvent);
+        g_selectionWinEventStopEvent = nullptr;
     }
 
     if (g_workerThread)
