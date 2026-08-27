@@ -160,46 +160,12 @@ When one file is selected, additional details can appear:
 
 #define CWM_GETISHELLBROWSER (WM_USER + 7)
 
-static constexpr UINT kNativeStatusTextFormat = 0x00000824;
 static constexpr int kStatusRowHeight = 24;
-static constexpr ULONGLONG kStatusMarkerLifetimeMs = 250;
 static constexpr DWORD kInitialRefreshDelayMs = 1000;
 static constexpr DWORD kRefreshIntervalMs = 10000;
 static constexpr ULONGLONG kContentFailedRetryMs = 2000;
 static constexpr ULONGLONG kMetadataRetryMs = 5000;
 
-// ============================================================
-// DrawText hook
-// ============================================================
-
-using DrawTextW_t = int (WINAPI*)(
-    HDC,
-    LPCWSTR,
-    int,
-    LPRECT,
-    UINT
-);
-
-static DrawTextW_t DrawTextW_Original = nullptr;
-
-using BitBlt_t = BOOL (WINAPI*)(
-    HDC,
-    int,
-    int,
-    int,
-    int,
-    HDC,
-    int,
-    int,
-    DWORD
-);
-
-static BitBlt_t BitBlt_Original = nullptr;
-
-// Correlate Explorer's buffered status render with the final DirectUIHWND copy.
-thread_local HDC g_statusSourceDc = nullptr;
-thread_local ULONGLONG g_statusMarkTick = 0;
-thread_local RECT g_statusRowRect{};
 thread_local bool g_insideFinalPaint = false;
 
 static std::atomic<bool> g_unloading{false};
@@ -257,6 +223,7 @@ struct TrackedDirectUiState
 };
 
 static std::vector<TrackedDirectUiState> g_trackedWindows;
+static std::vector<HWND> g_installingDirectUiWindows;
 
 struct ColorOverride
 {
@@ -301,6 +268,8 @@ static LRESULT CALLBACK DirectUiSubclassProc(
     DWORD_PTR
 );
 
+static void TryAttachExplorerDirectUiWindow(HWND hwnd);
+
 // ============================================================
 // State
 // ============================================================
@@ -315,6 +284,7 @@ static HANDLE g_selectionWinEventThread = nullptr;
 static HANDLE g_selectionWinEventThreadReady = nullptr;
 static HANDLE g_selectionWinEventStopEvent = nullptr;
 static HWINEVENTHOOK g_selectionWinEventHook = nullptr;
+static HWINEVENTHOOK g_windowCreateWinEventHook = nullptr;
 static std::atomic<ULONGLONG> g_selectionGeneration{1};
 static std::atomic<ULONGLONG> g_lastPaintWakeTick{0};
 
@@ -1902,32 +1872,6 @@ static bool GetValidatedStatusRow(
     return found;
 }
 
-static void SetValidatedStatusRow(
-    HWND hwnd,
-    const RECT& row
-)
-{
-    AcquireSRWLockExclusive(&g_subclassLock);
-
-    const auto existing =
-        std::find_if(
-            g_trackedWindows.begin(),
-            g_trackedWindows.end(),
-            [&](const TrackedDirectUiState& value)
-            {
-                return value.hwnd == hwnd;
-            }
-        );
-
-    if (existing != g_trackedWindows.end())
-    {
-        existing->validatedStatusRow = row;
-        existing->hasValidatedStatusRow = true;
-    }
-
-    ReleaseSRWLockExclusive(&g_subclassLock);
-}
-
 static void WakeWorkerFromPaint()
 {
     if (!g_workerWakeEvent)
@@ -1963,7 +1907,9 @@ static void CALLBACK SelectionWinEventProc(
 )
 {
     if (
-        event < EVENT_OBJECT_SELECTION ||
+        // A one-item A -> B transition can be focus-only, with no selection
+        // count change and no EVENT_OBJECT_SELECTION-family notification.
+        event < EVENT_OBJECT_FOCUS ||
         event > EVENT_OBJECT_SELECTIONWITHIN ||
         g_unloading.load(std::memory_order_acquire)
     )
@@ -1977,6 +1923,29 @@ static void CALLBACK SelectionWinEventProc(
         SetEvent(g_workerWakeEvent);
 }
 
+static void CALLBACK ExplorerObjectCreateWinEventProc(
+    HWINEVENTHOOK,
+    DWORD event,
+    HWND hwnd,
+    LONG idObject,
+    LONG,
+    DWORD,
+    DWORD
+)
+{
+    if (
+        event != EVENT_OBJECT_CREATE ||
+        idObject != OBJID_WINDOW ||
+        !hwnd ||
+        g_unloading.load(std::memory_order_acquire)
+    )
+    {
+        return;
+    }
+
+    TryAttachExplorerDirectUiWindow(hwnd);
+}
+
 static DWORD WINAPI SelectionWinEventThreadProc(
     LPVOID
 )
@@ -1988,7 +1957,7 @@ static DWORD WINAPI SelectionWinEventThreadProc(
 
     g_selectionWinEventHook =
         SetWinEventHook(
-            EVENT_OBJECT_SELECTION,
+            EVENT_OBJECT_FOCUS,
             EVENT_OBJECT_SELECTIONWITHIN,
             nullptr,
             SelectionWinEventProc,
@@ -2005,10 +1974,34 @@ static DWORD WINAPI SelectionWinEventThreadProc(
         );
     }
 
+    g_windowCreateWinEventHook =
+        SetWinEventHook(
+            EVENT_OBJECT_CREATE,
+            EVENT_OBJECT_CREATE,
+            nullptr,
+            ExplorerObjectCreateWinEventProc,
+            g_pid,
+            0,
+            WINEVENT_OUTOFCONTEXT
+        );
+
+    if (!g_windowCreateWinEventHook)
+    {
+        Wh_Log(
+            L"Explorer window-create WinEvent hook failed error=%lu",
+            GetLastError()
+        );
+    }
+
     SetEvent(g_selectionWinEventThreadReady);
 
-    if (!g_selectionWinEventHook)
+    if (
+        !g_selectionWinEventHook &&
+        !g_windowCreateWinEventHook
+    )
+    {
         return 1;
+    }
 
     bool quit = false;
 
@@ -2044,7 +2037,7 @@ static DWORD WINAPI SelectionWinEventThreadProc(
         else
         {
             Wh_Log(
-                L"selection WinEvent message wait failed result=%lu error=%lu",
+                L"WinEvent helper message wait failed result=%lu error=%lu",
                 waitResult,
                 GetLastError()
             );
@@ -2053,9 +2046,18 @@ static DWORD WINAPI SelectionWinEventThreadProc(
         }
     }
 
-    // The hook is installed, pumped and removed by this same owning thread.
-    UnhookWinEvent(g_selectionWinEventHook);
-    g_selectionWinEventHook = nullptr;
+    // Both hooks are installed, pumped and removed by this same owning thread.
+    if (g_windowCreateWinEventHook)
+    {
+        UnhookWinEvent(g_windowCreateWinEventHook);
+        g_windowCreateWinEventHook = nullptr;
+    }
+
+    if (g_selectionWinEventHook)
+    {
+        UnhookWinEvent(g_selectionWinEventHook);
+        g_selectionWinEventHook = nullptr;
+    }
 
     return 0;
 }
@@ -3229,54 +3231,51 @@ static bool IsExplorerDirectUiTarget(HWND hwnd)
     if (!IsDirectUiWindow(hwnd))
         return false;
 
-    HWND current = GetParent(hwnd);
-    bool sawDuiView = false;
-    bool sawShellTab = false;
-
-    while (current)
-    {
-        wchar_t cls[128] = {};
-        if (GetClassNameW(current, cls, ARRAYSIZE(cls)))
+    const auto hasClass =
+        [](HWND window, PCWSTR expected)
         {
-            if (!sawDuiView && wcscmp(cls, L"DUIViewWndClassName") == 0)
-                sawDuiView = true;
-            else if (sawDuiView && wcscmp(cls, L"ShellTabWindowClass") == 0)
-                sawShellTab = true;
-            else if (sawShellTab && wcscmp(cls, L"CabinetWClass") == 0)
-            {
-                DWORD pid = 0;
-                GetWindowThreadProcessId(current, &pid);
-                return pid == g_pid;
-            }
-        }
+            wchar_t cls[128] = {};
 
-        current = GetParent(current);
-    }
+            return
+                window &&
+                GetClassNameW(window, cls, ARRAYSIZE(cls)) &&
+                wcscmp(cls, expected) == 0;
+        };
 
-    return false;
-}
-
-static bool StatusMarkIsFresh(
-    HDC source
-)
-{
-    if (!g_statusSourceDc)
-        return false;
-
-    ULONGLONG now =
-        GetTickCount64();
+    const HWND duiView = GetParent(hwnd);
+    const HWND shellTab = duiView ? GetParent(duiView) : nullptr;
+    const HWND cabinet = shellTab ? GetParent(shellTab) : nullptr;
 
     if (
-        now - g_statusMarkTick >
-        kStatusMarkerLifetimeMs
+        !hasClass(duiView, L"DUIViewWndClassName") ||
+        !hasClass(shellTab, L"ShellTabWindowClass") ||
+        !hasClass(cabinet, L"CabinetWClass") ||
+        GetAncestor(hwnd, GA_ROOT) != cabinet
     )
     {
-        g_statusSourceDc = nullptr;
         return false;
     }
 
-    return source ==
-        g_statusSourceDc;
+    DWORD targetPid = 0;
+    const DWORD targetThread =
+        GetWindowThreadProcessId(hwnd, &targetPid);
+
+    const auto matchesTargetOwner =
+        [&](HWND window)
+        {
+            DWORD pid = 0;
+
+            return
+                GetWindowThreadProcessId(window, &pid) == targetThread &&
+                pid == targetPid;
+        };
+
+    return
+        targetThread != 0 &&
+        targetPid == g_pid &&
+        matchesTargetOwner(duiView) &&
+        matchesTargetOwner(shellTab) &&
+        matchesTargetOwner(cabinet);
 }
 
 static int MeasureTextWidth(
@@ -3444,7 +3443,7 @@ static void DrawFinalPiece(
         color
     );
 
-    DrawTextW_Original(
+    DrawTextW(
         hdc,
         text.c_str(),
         -1,
@@ -3616,9 +3615,8 @@ static void PaintFinalInfoBar(
 
     RECT row{};
 
-    // Only use a status-row rect after BitBlt_Hook validated it for this
-    // specific DirectUIHWND. Never paint from an unvalidated thread-local
-    // DrawText candidate.
+    // Structural attachment doesn't supply a native-copy row rectangle, so
+    // new targets use the geometric fallback below.
     const bool hasValidatedRow =
         GetValidatedStatusRow(
             hwnd,
@@ -4078,7 +4076,7 @@ static void PaintFinalInfoBar(
                 textColor
             );
 
-            DrawTextW_Original(
+            DrawTextW(
                 hdc,
                 value.c_str(),
                 -1,
@@ -4189,33 +4187,12 @@ static DirectUiSubclassResult EnsureDirectUiSubclass(
 )
 {
     if (
-        !hwnd ||
+        !IsExplorerDirectUiTarget(hwnd) ||
         g_unloading.load(
             std::memory_order_acquire
         )
     )
     {
-        return DirectUiSubclassResult::Failed;
-    }
-
-    DWORD hwndThread =
-        GetWindowThreadProcessId(
-            hwnd,
-            nullptr
-        );
-
-    if (
-        hwndThread !=
-        GetCurrentThreadId()
-    )
-    {
-        Wh_Log(
-            L"DirectUI subclass skipped: wrong thread hwnd=%p hwndTid=%lu currentTid=%lu",
-            hwnd,
-            hwndThread,
-            GetCurrentThreadId()
-        );
-
         return DirectUiSubclassResult::Failed;
     }
 
@@ -4255,6 +4232,33 @@ static DirectUiSubclassResult EnsureDirectUiSubclass(
     }
 
     if (
+        std::find(
+            g_installingDirectUiWindows.begin(),
+            g_installingDirectUiWindows.end(),
+            hwnd
+        ) != g_installingDirectUiWindows.end()
+    )
+    {
+        ReleaseSRWLockExclusive(&g_subclassLock);
+        return DirectUiSubclassResult::AlreadyInstalled;
+    }
+
+    try
+    {
+        g_installingDirectUiWindows.push_back(hwnd);
+    }
+    catch (...)
+    {
+        ReleaseSRWLockExclusive(&g_subclassLock);
+        Wh_Log(L"DirectUI install tracking failed hwnd=%p", hwnd);
+        return DirectUiSubclassResult::Failed;
+    }
+
+    // Never hold g_subclassLock while the utility synchronously marshals the
+    // actual SetWindowSubclass call to the HWND's owning Explorer UI thread.
+    ReleaseSRWLockExclusive(&g_subclassLock);
+
+    if (
         !WindhawkUtils::SetWindowSubclassFromAnyThread(
             hwnd,
             DirectUiSubclassProc,
@@ -4262,9 +4266,16 @@ static DirectUiSubclassResult EnsureDirectUiSubclass(
         )
     )
     {
-        ReleaseSRWLockExclusive(
-            &g_subclassLock
+        AcquireSRWLockExclusive(&g_subclassLock);
+        g_installingDirectUiWindows.erase(
+            std::remove(
+                g_installingDirectUiWindows.begin(),
+                g_installingDirectUiWindows.end(),
+                hwnd
+            ),
+            g_installingDirectUiWindows.end()
         );
+        ReleaseSRWLockExclusive(&g_subclassLock);
 
         Wh_Log(
             L"DirectUI subclass install failed hwnd=%p error=%lu",
@@ -4275,41 +4286,58 @@ static DirectUiSubclassResult EnsureDirectUiSubclass(
         return DirectUiSubclassResult::Failed;
     }
 
-    try
-    {
-        TrackedDirectUiState state;
-        state.hwnd = hwnd;
-        g_trackedWindows.push_back(
-            std::move(state)
+    bool keepInstalled = false;
+    bool trackingFailed = false;
+
+    AcquireSRWLockExclusive(&g_subclassLock);
+
+    const auto installing =
+        std::find(
+            g_installingDirectUiWindows.begin(),
+            g_installingDirectUiWindows.end(),
+            hwnd
         );
+
+    if (
+        installing != g_installingDirectUiWindows.end() &&
+        !g_unloading.load(std::memory_order_acquire)
+    )
+    {
+        try
+        {
+            TrackedDirectUiState state;
+            state.hwnd = hwnd;
+            g_trackedWindows.push_back(std::move(state));
+            keepInstalled = true;
+        }
+        catch (...)
+        {
+            trackingFailed = true;
+        }
     }
-    catch (...)
+
+    if (installing != g_installingDirectUiWindows.end())
+        g_installingDirectUiWindows.erase(installing);
+
+    ReleaseSRWLockExclusive(&g_subclassLock);
+
+    if (!keepInstalled)
     {
         WindhawkUtils::RemoveWindowSubclassFromAnyThread(
             hwnd,
             DirectUiSubclassProc
         );
 
-        ReleaseSRWLockExclusive(
-            &g_subclassLock
-        );
-
-        Wh_Log(
-            L"DirectUI subclass tracking failed hwnd=%p",
-            hwnd
-        );
+        if (trackingFailed)
+            Wh_Log(L"DirectUI subclass tracking failed hwnd=%p", hwnd);
 
         return DirectUiSubclassResult::Failed;
     }
 
-    ReleaseSRWLockExclusive(
-        &g_subclassLock
-    );
-
     EnsureWindowDataCache(hwnd);
     EnsureShellBrowserRegistration(hwnd);
 
-    // Run the follow-up invalidation after the native paint that installed us.
+    // Defer the first invalidation to the DirectUI owning thread.
     if (
         g_refreshDirectUiMessage &&
         !PostMessageW(
@@ -4328,6 +4356,12 @@ static DirectUiSubclassResult EnsureDirectUiSubclass(
     }
 
     return DirectUiSubclassResult::NewlyInstalled;
+}
+
+static void TryAttachExplorerDirectUiWindow(HWND hwnd)
+{
+    if (IsExplorerDirectUiTarget(hwnd))
+        EnsureDirectUiSubclass(hwnd);
 }
 
 static LRESULT CALLBACK DirectUiSubclassProc(
@@ -4359,6 +4393,14 @@ static LRESULT CALLBACK DirectUiSubclassProc(
 
         AcquireSRWLockExclusive(&g_subclassLock);
         UntrackDirectUiWindowLocked(hwnd);
+        g_installingDirectUiWindows.erase(
+            std::remove(
+                g_installingDirectUiWindows.begin(),
+                g_installingDirectUiWindows.end(),
+                hwnd
+            ),
+            g_installingDirectUiWindows.end()
+        );
         ReleaseSRWLockExclusive(&g_subclassLock);
 
         return DefSubclassProc(
@@ -4444,227 +4486,27 @@ static LRESULT CALLBACK DirectUiSubclassProc(
 }
 
 // ============================================================
-// DrawText marker hook
-// ============================================================
-
-static int WINAPI DrawTextW_Hook(
-    HDC hdc,
-    LPCWSTR text,
-    int count,
-    LPRECT rect,
-    UINT format
-)
-{
-    if (!DrawTextW_Original)
-        return 0;
-
-    // Language-independent marker: Explorer's native information row uses a
-    // distinctive DrawText format. Don't inspect the localized text at all.
-    // The BitBlt hook below performs the decisive validation by mapping this
-    // source rect into the destination DirectUIHWND and requiring it to land
-    // at the bottom of that Explorer view.
-    if (
-        !g_insideFinalPaint &&
-        rect &&
-        format == kNativeStatusTextFormat &&
-        rect->bottom > rect->top &&
-        rect->right > rect->left
-    )
-    {
-        g_statusSourceDc = hdc;
-        g_statusMarkTick = GetTickCount64();
-        g_statusRowRect = *rect;
-    }
-
-    return DrawTextW_Original(
-        hdc,
-        text,
-        count,
-        rect,
-        format
-    );
-}
-
-// ============================================================
-// Final DirectUI copy hook
-// ============================================================
-
-static BOOL WINAPI BitBlt_Hook(
-    HDC hdcDest,
-    int xDest,
-    int yDest,
-    int width,
-    int height,
-    HDC hdcSrc,
-    int xSrc,
-    int ySrc,
-    DWORD rop
-)
-{
-    bool relevant =
-        !g_insideFinalPaint &&
-        StatusMarkIsFresh(
-            hdcSrc
-        );
-
-    BOOL result =
-        BitBlt_Original(
-            hdcDest,
-            xDest,
-            yDest,
-            width,
-            height,
-            hdcSrc,
-            xSrc,
-            ySrc,
-            rop
-        );
-
-    if (!relevant)
-        return result;
-
-    HWND hwnd =
-        WindowFromDC(
-            hdcDest
-        );
-
-    if (!IsExplorerDirectUiTarget(hwnd))
-        return result;
-
-    // Map the candidate source text rect into destination coordinates and only
-    // accept it when it actually lands on Explorer's bottom information row.
-    RECT client{};
-    if (!GetClientRect(hwnd, &client))
-        return result;
-
-    RECT mappedRow = g_statusRowRect;
-    mappedRow.top = yDest + (g_statusRowRect.top - ySrc);
-    mappedRow.bottom = yDest + (g_statusRowRect.bottom - ySrc);
-    mappedRow.left = xDest + (g_statusRowRect.left - xSrc);
-    mappedRow.right = xDest + (g_statusRowRect.right - xSrc);
-
-    const int rowHeight = mappedRow.bottom - mappedRow.top;
-    const int expectedHeight = ScaleForWindow(hwnd, kStatusRowHeight);
-    const int bottomTolerance = ScaleForWindow(hwnd, 4);
-
-    if (
-        rowHeight < ScaleForWindow(hwnd, 16) ||
-        rowHeight > ScaleForWindow(hwnd, 34) ||
-        std::abs(mappedRow.bottom - client.bottom) > bottomTolerance ||
-        std::abs(rowHeight - expectedHeight) > ScaleForWindow(hwnd, 10)
-    )
-    {
-        return result;
-    }
-
-    SetValidatedStatusRow(hwnd, mappedRow);
-
-    if (
-        g_unloading.load(
-            std::memory_order_acquire
-        )
-    )
-    {
-        return result;
-    }
-
-    // This hook runs on DirectUI's UI thread, which is required for subclassing.
-    // Install the subclass here so every future WM_PAINT ends with our row.
-    const DirectUiSubclassResult subclassResult =
-        EnsureDirectUiSubclass(
-            hwnd
-        );
-
-    // The subclass cannot retroactively catch the WM_PAINT that is already
-    // in progress when it is first installed, so finish this current frame
-    // once directly after the relevant BitBlt.
-    if (
-        subclassResult ==
-        DirectUiSubclassResult::NewlyInstalled
-    )
-    {
-        g_insideFinalPaint =
-            true;
-
-        PaintFinalInfoBar(
-            hdcDest,
-            hwnd
-        );
-
-        g_insideFinalPaint =
-            false;
-    }
-
-    return result;
-}
-
-
-// ============================================================
 // Windhawk lifecycle
 // ============================================================
 
-struct ActivateExistingExplorerContext
-{
-    DWORD pid;
-};
-
-static BOOL CALLBACK ActivateDirectUiChildProc(
+static BOOL CALLBACK DiscoverDirectUiChildProc(
     HWND hwnd,
-    LPARAM lParam
+    LPARAM
 )
 {
-    auto* context =
-        reinterpret_cast<ActivateExistingExplorerContext*>(
-            lParam
-        );
+    if (g_unloading.load(std::memory_order_acquire))
+        return FALSE;
 
-    if (
-        g_unloading.load(std::memory_order_acquire) ||
-        !IsWindowVisible(hwnd)
-    )
-    {
-        return TRUE;
-    }
-
-    DWORD pid = 0;
-
-    GetWindowThreadProcessId(
-        hwnd,
-        &pid
-    );
-
-    if (pid != context->pid)
-        return TRUE;
-
-    wchar_t className[128] = {};
-
-    if (
-        GetClassNameW(
-            hwnd,
-            className,
-            ARRAYSIZE(className)
-        ) &&
-        wcscmp(className, L"DirectUIHWND") == 0
-    )
-    {
-        // The resulting native paint reaches BitBlt_Hook on this window's UI
-        // thread, where the existing correlation safely selects the target.
-        InvalidateInfoBarWindow(hwnd);
-    }
+    TryAttachExplorerDirectUiWindow(hwnd);
 
     return TRUE;
 }
 
-static BOOL CALLBACK ActivateExistingExplorerProc(
+static BOOL CALLBACK DiscoverExistingExplorerWindowProc(
     HWND hwnd,
-    LPARAM lParam
+    LPARAM
 )
 {
-    auto* context =
-        reinterpret_cast<ActivateExistingExplorerContext*>(
-            lParam
-        );
-
     if (g_unloading.load(std::memory_order_acquire))
         return FALSE;
 
@@ -4676,8 +4518,7 @@ static BOOL CALLBACK ActivateExistingExplorerProc(
     );
 
     if (
-        pid != context->pid ||
-        !IsWindowVisible(hwnd)
+        pid != g_pid
     )
     {
         return TRUE;
@@ -4699,11 +4540,19 @@ static BOOL CALLBACK ActivateExistingExplorerProc(
 
     EnumChildWindows(
         hwnd,
-        ActivateDirectUiChildProc,
-        lParam
+        DiscoverDirectUiChildProc,
+        0
     );
 
     return TRUE;
+}
+
+static void DiscoverExistingExplorerWindows()
+{
+    EnumWindows(
+        DiscoverExistingExplorerWindowProc,
+        0
+    );
 }
 
 BOOL Wh_ModInit()
@@ -4745,104 +4594,6 @@ BOOL Wh_ModInit()
     }
 
     LoadSettings();
-
-    HMODULE user32 =
-        GetModuleHandleW(
-            L"user32.dll"
-        );
-
-    HMODULE gdi32 =
-        GetModuleHandleW(
-            L"gdi32.dll"
-        );
-
-    if (!user32 || !gdi32)
-    {
-        Wh_Log(
-            L"required system module not loaded"
-        );
-
-        DeleteCriticalSection(
-            &g_cacheLock
-        );
-
-        return FALSE;
-    }
-
-    void* drawTextTarget =
-        reinterpret_cast<void*>(
-            GetProcAddress(
-                user32,
-                "DrawTextW"
-            )
-        );
-
-    void* bitBltTarget =
-        reinterpret_cast<void*>(
-            GetProcAddress(
-                gdi32,
-                "BitBlt"
-            )
-        );
-
-    if (!drawTextTarget || !bitBltTarget)
-    {
-        Wh_Log(
-            L"required GDI targets not found"
-        );
-
-        DeleteCriticalSection(
-            &g_cacheLock
-        );
-
-        return FALSE;
-    }
-
-    if (
-        !Wh_SetFunctionHook(
-            drawTextTarget,
-            reinterpret_cast<void*>(
-                DrawTextW_Hook
-            ),
-            reinterpret_cast<void**>(
-                &DrawTextW_Original
-            )
-        )
-    )
-    {
-        Wh_Log(
-            L"DrawTextW hook failed"
-        );
-
-        DeleteCriticalSection(
-            &g_cacheLock
-        );
-
-        return FALSE;
-    }
-
-    if (
-        !Wh_SetFunctionHook(
-            bitBltTarget,
-            reinterpret_cast<void*>(
-                BitBlt_Hook
-            ),
-            reinterpret_cast<void**>(
-                &BitBlt_Original
-            )
-        )
-    )
-    {
-        Wh_Log(
-            L"BitBlt hook failed"
-        );
-
-        DeleteCriticalSection(
-            &g_cacheLock
-        );
-
-        return FALSE;
-    }
 
     g_stopEvent =
         CreateEventW(
@@ -5012,17 +4763,7 @@ BOOL Wh_ModInit()
 
 void Wh_ModAfterInit()
 {
-    ActivateExistingExplorerContext context{
-        g_pid
-    };
-
-    EnumWindows(
-        ActivateExistingExplorerProc,
-        reinterpret_cast<LPARAM>(
-            &context
-        )
-    );
-
+    DiscoverExistingExplorerWindows();
 }
 
 
@@ -5080,8 +4821,7 @@ void Wh_ModBeforeUninit()
             // The overlay is drawn after Explorer's native buffered paint, so
             // removing the subclass alone leaves those pixels on screen until
             // the next native repaint. Force the status row to repaint now
-            // while the GDI hooks are still installed but g_unloading prevents
-            // any new overlay from being drawn.
+            // while g_unloading prevents any new overlay from being drawn.
             RECT client{};
             if (GetClientRect(hwnd, &client))
             {
