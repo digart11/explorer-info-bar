@@ -1,8 +1,8 @@
-# Explorer Info Bar
+# Explorer Info Bar+
 
 Adds drive, folder, selection, and file details to File Explorer's bottom info bar.
 
-![Explorer Info Bar preview](images/explorer-info-bar-preview.png)
+![Explorer Info Bar+ preview](images/explorer-info-bar-preview.png)
 
 ## Features
 
