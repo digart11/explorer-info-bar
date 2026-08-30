@@ -20,7 +20,7 @@ Explorer Info Bar+ uses the native Windows 11 bottom status area; it does not re
 
 Do not enable Classic Explorer Status Bar or PreVista Explorer Status Bar at the same time as Explorer Info Bar+. Both try to control the same bottom Explorer area and can conflict or overlap.
 
-Explorer Status Bar Metadata overlaps functionally because Explorer Info Bar+ already includes optional single-file metadata. Its metadata functionality is integrated here; no broader incompatibility is implied.
+Explorer Info Bar+ paints over the native status-row text, including output from Explorer Status Bar Metadata. Do not enable Explorer Status Bar Metadata at the same time because its output will be covered. When Explorer Status Bar Metadata is not used, Explorer Info Bar+'s optional Single File Details can provide file extension, dimensions, and duration when available.
 
 ## Example
 
