@@ -17,7 +17,7 @@
 
 A customizable Windhawk mod that enhances the bottom info bar in Windows 11 File Explorer.
 
-Explorer Info Bar+ adds drive, folder, selection, literal file-extension, and basic media/image metadata information while keeping the native Explorer look and adapting to light, dark, and customized themes.
+Explorer Info Bar+ adds drive, folder, selection, literal file-extension, photo/RAW, and video/audio information while keeping the native Explorer look and adapting to light, dark, and customized themes.
 
 Unlike mods that restore the classic status bar or focus only on metadata, Explorer Info Bar+ combines several information groups in one modern, configurable Windows 11 info bar.
 
@@ -45,6 +45,7 @@ Unlike mods that restore the classic status bar or focus only on metadata, Explo
   - Simple
   - Flat panes
   - Soft cards
+- Solid or four-direction gradient panel fills for Flat panes and Soft cards
 - Configurable section order
 - Individual section visibility controls
 - Configurable font family and safe font-size range
@@ -56,7 +57,7 @@ Unlike mods that restore the classic status bar or focus only on metadata, Explo
 
 ## Compatibility / Why this mod is separate
 
-Explorer Info Bar+ uses the native Windows 11 bottom status area; it does not restore or create a classic `msctls_statusbar32`-style status bar. It combines drive, content, and selection information with configurable ordering, styles, colors, literal extension display, and basic image/media metadata in one native-style bar. This is a different presentation and design from Classic Explorer Status Bar and PreVista Explorer Status Bar.
+Explorer Info Bar+ uses the native Windows 11 bottom status area; it does not restore or create a classic `msctls_statusbar32`-style status bar. It combines drive, content, and selection information with configurable ordering, styles, colors, literal extension display, and photo/RAW and video/audio metadata in one native-style bar. This is a different presentation and design from Classic Explorer Status Bar and PreVista Explorer Status Bar.
 
 Do not enable Classic Explorer Status Bar or PreVista Explorer Status Bar at the same time as Explorer Info Bar+. Both try to control the same bottom Explorer area and can conflict or overlap.
 
@@ -76,9 +77,9 @@ When one file is selected, additional details can appear:
 
 ```text
 .jpg  ·  4032×3024  ·  Nikon Z8  ·  NIKKOR Z 24-70mm f/2.8 S
-.jpeg  ·  6000×4000
-.mp4  ·  1920×1080  ·  01:23:43
-.mp3  ·  00:03:47
+.cr3  ·  4498×6742  ·  EOS R  ·  ISO 400  ·  f/1.4  ·  1/125s  ·  85mm
+.mp4  ·  3840×2160  ·  01:49:19  ·  24 fps
+.mp3  ·  00:03:47  ·  44.1 kHz  ·  Stereo
 .doc
 .pdf
 ```
@@ -705,11 +706,11 @@ static void LoadSettings()
             L"panelFill"
         );
 
-    if (panelFill == L"left-right" || panelFill == L"horizontal")
+    if (panelFill == L"left-right")
         settings.panelFill = PanelFillStyle::LeftToRightGradient;
     else if (panelFill == L"right-left")
         settings.panelFill = PanelFillStyle::RightToLeftGradient;
-    else if (panelFill == L"top-bottom" || panelFill == L"vertical")
+    else if (panelFill == L"top-bottom")
         settings.panelFill = PanelFillStyle::TopToBottomGradient;
     else if (panelFill == L"bottom-top")
         settings.panelFill = PanelFillStyle::BottomToTopGradient;
